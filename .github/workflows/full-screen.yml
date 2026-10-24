@@ -15,7 +15,10 @@ concurrency:
 jobs:
   screen:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 340
+    env:
+      LS_DATA_DIR: site/data
+      LS_CACHE_DIR: site/cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,13 +27,31 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest
       - run: python -m pytest -q tests
-      - run: python screener.py full
-      - name: Commit results
+
+      - name: Load the last published data
         run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git clone --depth 1 --branch gh-pages "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" site
+            rm -rf site/.git
+          else
+            # first run on the gh-pages setup: carry over what the old setup saved on main
+            mkdir -p site/data site/cache
+            if ! grep -q '"demo":true' docs/data/screen.json 2>/dev/null; then cp docs/data/*.json site/data/ 2>/dev/null || true; fi
+            cp cache/*.json site/cache/ 2>/dev/null || true
+          fi
+
+      - run: python screener.py full
+
+      - name: Publish dashboard and data to gh-pages
+        if: always()
+        run: |
+          [ -f site/data/screen.json ] || { echo "No data written"; exit 1; }
+          cp docs/index.html docs/style.css docs/app.js site/
+          touch site/.nojekyll
+          cd site
+          git init -q -b gh-pages
           git config user.name "screener-bot"
           git config user.email "screener-bot@users.noreply.github.com"
-          git add docs/data cache
-          git diff --cached --quiet && exit 0
-          git commit -m "Full screen $(date -u +%Y-%m-%d)"
-          for i in 1 2 3 4; do git pull --rebase -X theirs && git push && exit 0; sleep $((i*5)); done
-          exit 1
+          git add -A
+          git commit -qm "Full screen $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
