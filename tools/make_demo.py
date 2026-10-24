@@ -21,14 +21,26 @@ rng = random.Random(7)
 np_rng = np.random.default_rng(7)
 
 A = ["North", "Blue", "Iron", "Cedar", "Summit", "Harbor", "Granite", "Silver", "Prairie", "Atlas", "Beacon", "Keystone",
-     "Pioneer", "Meridian", "Orchard", "Falcon", "Copper", "Lakeside", "Redwood", "Polar", "Vantage", "Crescent", "Juniper"]
+     "Pioneer", "Meridian", "Orchard", "Falcon", "Copper", "Lakeside", "Redwood", "Polar", "Vantage", "Crescent", "Juniper",
+     "Alder", "Basalt", "Cobalt", "Delta", "Ember", "Fjord", "Glacier", "Heron", "Indigo", "Kestrel", "Lumen", "Maple",
+     "Nimbus", "Onyx", "Pinnacle", "Quarry", "Ridge", "Sable", "Tundra", "Umber", "Willow", "Zephyr"]
 B = ["Instruments", "Systems", "Foods", "Logistics", "Software", "Therapeutics", "Industries", "Materials", "Networks",
      "Brands", "Energy", "Devices", "Analytics", "Health", "Robotics", "Semiconductor", "Outfitters", "Holdings"]
 SECTORS = {"Technology": (0.6, 0.15), "Healthcare": (0.55, 0.08), "Industrials": (0.33, 0.06), "Consumer Cyclical": (0.4, 0.06),
            "Consumer Defensive": (0.38, 0.04), "Communication Services": (0.5, 0.07), "Energy": (0.3, 0.03),
            "Basic Materials": (0.28, 0.03), "Utilities": (0.4, 0.02), "Financial Services": (0.0, 0.05),
            "Real Estate": (0.6, 0.03)}
-N = 320
+N = 520
+FXD = {"USD": 1.0, "GBP": 1.30, "GBp": 0.013, "EUR": 1.08, "JPY": 0.0067, "CAD": 0.73, "HKD": 0.128, "INR": 0.012,
+       "AUD": 0.66, "CHF": 1.13, "BRL": 0.18, "KRW": 0.00073, "SEK": 0.095}
+# region, suffix, listing currency, reporting currency, country, exchange label
+INTL = [("gb", ".L", "GBp", "GBP", "United Kingdom", "LSE"), ("de", ".DE", "EUR", "EUR", "Germany", "XETRA"),
+        ("fr", ".PA", "EUR", "EUR", "France", "Paris"), ("jp", ".T", "JPY", "JPY", "Japan", "Tokyo"),
+        ("ca", ".TO", "CAD", "CAD", "Canada", "Toronto"), ("hk", ".HK", "HKD", "CNY", "China", "HKSE"),
+        ("in", ".NS", "INR", "INR", "India", "NSE"), ("au", ".AX", "AUD", "AUD", "Australia", "ASX"),
+        ("ch", ".SW", "CHF", "CHF", "Switzerland", "SIX Swiss"), ("br", ".SA", "BRL", "BRL", "Brazil", "Sao Paulo"),
+        ("kr", ".KS", "KRW", "KRW", "South Korea", "KSE"), ("se", ".ST", "SEK", "SEK", "Sweden", "Stockholm")]
+FXD["CNY"] = 0.14
 
 
 def make_universe():
@@ -41,8 +53,16 @@ def make_universe():
         if t in tickers:
             continue
         names.add(name)
-        tickers[t] = {"name": name, "sector": rng.choices(list(SECTORS), weights=[16, 12, 14, 10, 6, 5, 5, 5, 4, 14, 6])[0],
-                      "idx": rng.choice(["S&P 500", "S&P 400", "S&P 600"])}
+        u = {"name": name, "sector": rng.choices(list(SECTORS), weights=[16, 12, 14, 10, 6, 5, 5, 5, 4, 14, 6])[0],
+             "idx": rng.choice(["S&P 500", "S&P 400", "S&P 600"]), "region": "us", "cur": "USD", "fin": "USD",
+             "country": "United States", "exch": None}
+        if rng.random() < 0.45:
+            region, suffix, cur, fin, country, exch = rng.choice(INTL)
+            t += suffix
+            u.update(region=region, cur=cur, fin=fin, country=country, exch=exch, idx=None)
+        if t in tickers:
+            continue
+        tickers[t] = u
     return tickers
 
 
@@ -57,7 +77,9 @@ for t, u in UNI.items():
     WORLD[t] = dict(gm=gm, growth=growth, rev=rev0, om=om, lev=max(0.0, rng.gauss(0.7, 0.6)),
                     mult=max(4, rng.gauss(20, 8)), drift=rng.gauss(0.08, 0.25), vol=rng.uniform(0.18, 0.55))
     eps = rev0 * om * 0.76 / 1e8
-    WORLD[t]["price"] = max(5.0, eps * WORLD[t]["mult"]) if eps > 0 else rng.uniform(8, 60)
+    usd_price = max(5.0, eps * WORLD[t]["mult"]) if eps > 0 else rng.uniform(8, 60)
+    WORLD[t]["usd_price"] = usd_price
+    WORLD[t]["price"] = usd_price / FXD[u["cur"]]  # listing currency
 
 
 def fake_statements(t):
@@ -83,7 +105,8 @@ def fake_statements(t):
                         "Total Liabilities Net Minority Interest": [a - e for a, e in zip(assets, equity)],
                         "Retained Earnings": [e * 0.6 for e in equity]}, index=dates).T
     cf = pd.DataFrame({"Operating Cash Flow": ocf, "Free Cash Flow": [o - r * 0.04 for o, r in zip(ocf, rev)]}, index=dates).T
-    return S.statement_metrics(inc, bal, cf)
+    k = 1 / FXD[UNI[t]["fin"]]
+    return S.statement_metrics(inc * k, bal * k, cf * k)
 
 
 PRICES = {}
@@ -96,21 +119,28 @@ for t, w in WORLD.items():
 
 def fake_info(t):
     w, u = WORLD[t], UNI[t]
+    k = 1 / FXD[u["fin"]]  # USD -> reporting currency
     ni = w["rev"] * w["om"] * 0.76
     shares = 1e8
-    eps = ni / shares
     price = w["price"]
-    mcap = price * shares
+    mcap_usd = w["usd_price"] * shares
+    eps = ni / shares * FXD["USD"] / FXD[u["cur"]]  # per share, in listing currency (Yahoo convention when they match)
+    eps_fin = ni / shares * k
     equity = w["rev"] * 0.8
     fcf = ni * rng.uniform(0.6, 1.3)
+    major = S.base_ccy(u["cur"])[0]
+    w = {**w, "rev": w["rev"] * k}
     return {"quoteType": "EQUITY", "shortName": u["name"], "sector": u["sector"], "industry": u["sector"],
-            "marketCap": mcap, "currentPrice": price, "trailingEps": eps, "trailingPE": price / eps if eps > 0 else None,
+            "currency": u["cur"], "financialCurrency": u["fin"], "country": u["country"], "fullExchangeName": u["exch"],
+            "sharesOutstanding": shares, "averageVolume": rng.uniform(2e5, 5e6),
+            "marketCap": mcap_usd / FXD[major], "currentPrice": price, "trailingEps": eps_fin,
+            "trailingPE": price / eps if eps > 0 else None,
             "trailingPegRatio": (price / eps) / max(1, w["growth"] * 100 + rng.gauss(4, 3)) if eps > 0 else None,
             "forwardPE": price / (eps * (1 + w["growth"])) if eps > 0 else None,
-            "freeCashflow": fcf, "totalRevenue": w["rev"], "debtToEquity": w["lev"] * 100,
+            "freeCashflow": fcf * k, "totalRevenue": w["rev"], "debtToEquity": w["lev"] * 100,
             "grossMargins": w["gm"], "operatingMargins": w["om"], "returnOnEquity": ni / equity,
-            "ebitda": w["rev"] * (w["om"] + 0.04), "totalDebt": equity * w["lev"], "totalCash": w["rev"] * 0.1,
-            "enterpriseValue": mcap + equity * w["lev"] - w["rev"] * 0.1, "priceToSalesTrailing12Months": mcap / w["rev"],
+            "ebitda": w["rev"] * (w["om"] + 0.04), "totalDebt": equity * k * w["lev"], "totalCash": w["rev"] * 0.1,
+            "priceToSalesTrailing12Months": mcap_usd / (w["rev"] / k),
             "currentRatio": rng.uniform(0.7, 3.0), "revenueGrowth": w["growth"] + rng.gauss(0, 0.04),
             "beta": rng.uniform(0.5, 1.8), "recommendationMean": rng.uniform(1.5, 3.4),
             "numberOfAnalystOpinions": rng.randint(3, 40), "heldPercentInsiders": rng.uniform(0.001, 0.15),
@@ -122,7 +152,10 @@ def fake_info(t):
 def main(out=ROOT / "docs" / "data"):
     out = Path(out)
     S.DATA, S.CACHE = out, out / "_demo_cache"
-    S.get_universe = lambda: {t: u["idx"] for t, u in UNI.items()}
+    S.fx_rates = lambda currencies, known=None: dict(FXD)
+    S.us_universe = lambda: {t: {"region": "us", "idx": u["idx"]} for t, u in UNI.items() if u["region"] == "us"}
+    S.intl_universe = lambda fx: {t: {"region": u["region"]} for t, u in UNI.items() if u["region"] != "us"}
+    S.INTL_MIN_MCAP_USD = 5e8
     S.fetch_info = fake_info
     S.fetch_statements = fake_statements
     S.download_prices = lambda tickers, period="14mo": pd.DataFrame({t: PRICES[t] for t in tickers})
@@ -132,7 +165,7 @@ def main(out=ROOT / "docs" / "data"):
 
     screen = json.loads((out / "screen.json").read_text())
     screen.update(demo=True, generated="2026-10-23T21:45:00+00:00", prices_updated="2026-10-23T20:30:00+00:00",
-                  universe="Sample universe (fictional companies)")
+                  universe="Sample universe (fictional companies, 12 countries)")
     S.save_json(out / "screen.json", screen, records=True)
 
     # fabricate 90 trading days of history so the trend chart has something to show

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Long-hold stock screener: quality at a reasonable price, S&P 1500 universe.
+"""Long-hold stock screener: quality at a reasonable price, global universe.
 
 Two modes:
-  python screener.py full     # fundamentals + prices for the whole universe (daily, after the close)
-  python screener.py prices   # refresh prices and price-based ratios only (hourly, during market hours)
+  python screener.py full     # fundamentals + prices for the whole universe (daily, after the US close)
+  python screener.py prices   # refresh prices and price-based ratios only (hourly on weekdays)
 
-Writes the dashboard's data files to docs/data/. Data comes from Yahoo Finance via yfinance (free).
-Edit CRITERIA below to change the default screen; the dashboard reads its defaults from here.
+Universe: S&P 500 + 400 + 600 in the US, plus every stock worth INTL_MIN_MCAP_USD or more on the main
+exchange of ~50 other countries. All money figures are converted to US dollars.
+
+Writes the dashboard's data files to docs/data/ (or $LS_DATA_DIR). Data comes from Yahoo Finance via
+yfinance (free). Edit CRITERIA below to change the default screen; the dashboard reads its defaults from here.
 """
 from __future__ import annotations
 
@@ -15,6 +18,8 @@ import datetime as dt
 import io
 import json
 import math
+import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,21 +30,64 @@ import pandas as pd
 import requests
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "docs" / "data"
-CACHE = ROOT / "cache"
+DATA = Path(os.environ.get("LS_DATA_DIR") or ROOT / "docs" / "data")
+CACHE = Path(os.environ.get("LS_CACHE_DIR") or ROOT / "cache")
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 EXCLUDE_SECTORS = ["Financial Services", "Real Estate"]  # D/E, ROE and FCF mean different things there
-EXTRA_TICKERS: list[str] = []          # add anything outside the S&P 1500, e.g. ["ASML", "TSM"]
+EXTRA_TICKERS: list[str] = []          # anything else, using Yahoo symbols, e.g. ["ASML", "7203.T", "MC.PA"]
+INTERNATIONAL = True                   # False = US only (S&P 1500)
+INTL_MIN_MCAP_USD = 2e9                # international stocks below this aren't loaded at all
 STATEMENT_MAX_AGE_DAYS = 7             # annual statements are re-pulled at most weekly
 STATEMENT_MIN_MCAP = 1e9               # skip statement pulls for tiny names (saves requests)
+STATEMENT_BUDGET = 2500                # max companies whose statements are pulled per run (biggest first)
+TIME_BUDGET_MIN = 270                  # stop starting new statement pulls after this, so the run always finishes
 WORKERS = 6                            # parallel Yahoo requests; lower it if you get rate limited
 HISTORY_DAYS = 400
 
-# Each criterion: key, group, label, op (min/max/pe_or_peg), default value, on by default, format, help.
-# The ones switched on are the agreed core screen; the rest are one click away in the dashboard.
+# Main exchange(s) per country, as Yahoo names them. Delete a line to drop that country.
+INTL_EXCHANGES = {
+    "ca": ["TOR"], "gb": ["LSE"], "ie": ["ISE"],
+    "de": ["GER"], "fr": ["PAR"], "nl": ["AMS"], "be": ["BRU"], "ch": ["EBS"], "at": ["VIE"], "it": ["MIL"],
+    "es": ["MCE"], "pt": ["LIS"], "se": ["STO"], "dk": ["CPH"], "no": ["OSL"], "fi": ["HEL"], "is": ["ICE"],
+    "pl": ["WSE"], "cz": ["PRA"], "hu": ["BUD"], "gr": ["ATH"], "ro": ["BVB"],
+    "jp": ["JPX"], "cn": ["SHH", "SHZ"], "hk": ["HKG"], "in": ["NSI"], "kr": ["KSC", "KOE"], "tw": ["TAI", "TWO"],
+    "au": ["ASX"], "nz": ["NZE"], "sg": ["SES"], "my": ["KLS"], "th": ["SET"], "id": ["JKT"], "ph": ["PHS"],
+    "vn": ["VSE"],
+    "br": ["SAO"], "mx": ["MEX"], "cl": ["SGO"], "co": ["BVC"], "ar": ["BUE"],
+    "il": ["TLV"], "tr": ["IST"], "za": ["JNB"], "sa": ["SAU"], "ae": ["DFM"], "qa": ["DOH"], "kw": ["KUW"],
+    "eg": ["CAI"],
+}
+
+# Dashboard market groups
+_EUROPE = ["de", "fr", "nl", "be", "ch", "at", "it", "es", "pt", "se", "dk", "no", "fi", "is", "pl", "cz", "hu", "gr", "ro"]
+_APAC = ["kr", "tw", "au", "nz", "sg", "my", "th", "id", "ph", "vn"]
+_LATAM = ["br", "mx", "cl", "co", "ar"]
+_MEA = ["il", "tr", "za", "sa", "ae", "qa", "kw", "eg"]
+MARKET_OF_REGION = {"us": "US", "ca": "Canada", "gb": "UK & Ireland", "ie": "UK & Ireland", "jp": "Japan",
+                    "cn": "China & HK", "hk": "China & HK", "in": "India",
+                    **{r: "Europe" for r in _EUROPE}, **{r: "Asia-Pacific" for r in _APAC},
+                    **{r: "Latin America" for r in _LATAM}, **{r: "Middle East & Africa" for r in _MEA}}
+COUNTRY_MARKET = {
+    "United States": "US", "Canada": "Canada", "United Kingdom": "UK & Ireland", "Ireland": "UK & Ireland",
+    "Japan": "Japan", "China": "China & HK", "Hong Kong": "China & HK", "India": "India",
+    **{c: "Europe" for c in ["Germany", "France", "Netherlands", "Belgium", "Switzerland", "Austria", "Italy", "Spain",
+                             "Portugal", "Sweden", "Denmark", "Norway", "Finland", "Iceland", "Poland",
+                             "Czech Republic", "Hungary", "Greece", "Romania"]},
+    **{c: "Asia-Pacific" for c in ["South Korea", "Taiwan", "Australia", "New Zealand", "Singapore", "Malaysia",
+                                   "Thailand", "Indonesia", "Philippines", "Vietnam"]},
+    **{c: "Latin America" for c in ["Brazil", "Mexico", "Chile", "Colombia", "Argentina", "Peru"]},
+    **{c: "Middle East & Africa" for c in ["Israel", "Turkey", "South Africa", "Saudi Arabia", "United Arab Emirates",
+                                           "Qatar", "Kuwait", "Egypt"]},
+}
+# Currencies needed up front (to size up international listings); others are fetched as they appear
+BASE_CCYS = ["CAD", "GBP", "EUR", "CHF", "SEK", "NOK", "DKK", "ISK", "PLN", "CZK", "HUF", "RON", "JPY", "CNY",
+             "HKD", "INR", "KRW", "TWD", "AUD", "NZD", "SGD", "MYR", "THB", "IDR", "PHP", "VND", "BRL", "MXN",
+             "CLP", "COP", "ARS", "ILS", "TRY", "ZAR", "SAR", "AED", "QAR", "KWD", "EGP"]
+MINOR_CCY = {"GBp": ("GBP", 0.01), "GBX": ("GBP", 0.01), "ZAc": ("ZAR", 0.01), "ILA": ("ILS", 0.01)}
+
 CRITERIA = [
     # Size & valuation
     ("mcap", "Size & valuation", "Market cap", "min", 2e9, True, "usd", "Liquidity and survivorship floor."),
@@ -96,7 +144,6 @@ DISPLAY = {
     "inst": ("Institutional ownership", "pct"), "analysts": ("Analysts covering", "int"),
     "score": ("Composite score", "int"), "coverage": ("Data coverage", "pct"),
 }
-
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -165,7 +212,6 @@ def with_retries(fn, tries=4, base=3.0):
             limited = "RateLimit" in type(e).__name__ or "429" in str(e) or "Too Many" in str(e)
             time.sleep(base * (2 ** i) * (4 if limited else 1))
 
-
 # ---------------------------------------------------------------------------
 # universe
 # ---------------------------------------------------------------------------
@@ -176,10 +222,10 @@ WIKI = {
 }
 
 
-def get_universe() -> dict[str, str]:
-    """{ticker: index name}. Falls back to the last good copy if Wikipedia is unreachable."""
-    cache_file = CACHE / "universe.json"
-    out: dict[str, str] = {}
+def us_universe() -> dict[str, dict]:
+    """{ticker: {"region": "us", "idx": index}}. Falls back to the last good copy if Wikipedia is unreachable."""
+    cache_file = CACHE / "universe_us.json"
+    out: dict[str, dict] = {}
     headers = {"User-Agent": "Mozilla/5.0 (long-screener; personal use)"}
     for idx, url in WIKI.items():
         try:
@@ -188,23 +234,132 @@ def get_universe() -> dict[str, str]:
                 col = next((c for c in table.columns if str(c).lower() in ("symbol", "ticker", "ticker symbol")), None)
                 if col is not None:
                     for t in table[col].dropna().astype(str):
-                        out.setdefault(t.strip().replace(".", "-"), idx)
+                        out.setdefault(t.strip().replace(".", "-"), {"region": "us", "idx": idx})
                     break
         except Exception as e:
             print(f"  ! could not load {idx} list: {e}", file=sys.stderr)
-    for t in EXTRA_TICKERS:
-        out.setdefault(t, "Extra")
     if len(out) > 1000:
         save_json(cache_file, out)
         return out
-    cached = load_json(cache_file, {})
+    cached = load_json(cache_file, {}) or {t: {"region": "us", "idx": i} for t, i in load_json(CACHE / "universe.json", {}).items()}
     if cached:
-        print(f"  using cached universe ({len(cached)} tickers)")
-        cached.update({t: "Extra" for t in EXTRA_TICKERS if t not in cached})
+        print(f"  using cached US universe ({len(cached)} tickers)")
         return cached
     if out:
         return out
-    raise SystemExit("No universe available: Wikipedia unreachable and no cache/universe.json yet.")
+    raise SystemExit("No US universe available: Wikipedia unreachable and no cached copy yet.")
+
+
+def base_ccy(cur: str | None) -> tuple[str, float]:
+    cur = cur or "USD"
+    return MINOR_CCY.get(cur, (cur, 1.0))
+
+
+def fx_rates(currencies, known: dict | None = None) -> dict[str, float]:
+    """US dollars per unit of each currency (minor units like GBp handled). Cached for when Yahoo hiccups."""
+    rates = dict(known or {})
+    rates["USD"] = 1.0
+    need = sorted({base_ccy(c)[0] for c in currencies if c} - set(rates))
+    if need:
+        try:
+            closes = download_prices([f"{c}USD=X" for c in need], period="5d")
+            for c in need:
+                col = f"{c}USD=X"
+                if col in closes.columns and closes[col].dropna().size:
+                    rates[c] = float(closes[col].dropna().iloc[-1])
+        except Exception as e:
+            print(f"  ! FX download failed: {e}", file=sys.stderr)
+        cached = load_json(CACHE / "fx.json", {})
+        for c in need:
+            if c not in rates and c in cached:
+                rates[c] = cached[c]
+        save_json(CACHE / "fx.json", {**cached, **{k: v for k, v in rates.items() if k not in MINOR_CCY}})
+    for c in currencies:
+        if c in MINOR_CCY and MINOR_CCY[c][0] in rates:
+            rates[c] = rates[MINOR_CCY[c][0]] * MINOR_CCY[c][1]
+    return rates
+
+
+def intl_universe(fx: dict) -> dict[str, dict]:
+    """Every listing on each country's main exchange worth roughly INTL_MIN_MCAP_USD or more.
+
+    Uses Yahoo's screener sorted by market cap, and stops paging once listings fall well below the floor.
+    The floor is applied loosely here (half of it, major-currency units) and exactly once per-stock data is in.
+    """
+    import yfinance as yf
+
+    EQ = yf.EquityQuery
+    out: dict[str, dict] = {}
+    floor = INTL_MIN_MCAP_USD * 0.5
+    for region, exchanges in INTL_EXCHANGES.items():
+        q = EQ("and", [EQ("eq", ["region", region]), EQ("is-in", ["exchange", *exchanges])])
+        offset, n = 0, 0
+        while True:
+            try:
+                res = with_retries(lambda: yf.screen(q, offset=offset, size=250, sortField="intradaymarketcap", sortAsc=False))
+            except Exception as e:
+                print(f"  ! {region}: screener failed at offset {offset}: {type(e).__name__}", file=sys.stderr)
+                break
+            quotes = res.get("quotes") or []
+            last_usd = None
+            for qt in quotes:
+                cur, mult = base_ccy(qt.get("currency"))
+                rate = fx.get(cur)
+                mc = num(qt.get("marketCap"))
+                if rate is None or mc is None:
+                    continue
+                last_usd = mc * rate  # loose: treats minor units (pence) as major, so nothing is cut wrongly
+                if last_usd >= floor and qt.get("quoteType", "EQUITY") == "EQUITY" and qt.get("symbol"):
+                    out[qt["symbol"]] = {"region": region}
+                    n += 1
+            offset += len(quotes)
+            if not quotes or offset >= (res.get("total") or 0) or (last_usd is not None and last_usd < floor):
+                break
+            time.sleep(0.3)
+        print(f"    {region}: {n}")
+    return out
+
+
+_SUFFIXES = {"inc", "incorporated", "corp", "corporation", "co", "company", "ltd", "limited", "plc", "ag", "sa", "se",
+             "nv", "bv", "ab", "asa", "as", "oyj", "spa", "sab", "de", "cv", "kk", "tbk", "bhd", "berhad", "pcl",
+             "holdings", "holding", "group", "the", "adr", "class", "a", "b", "ord", "shs", "reg", "registered"}
+
+
+def norm_name(name: str | None) -> str:
+    words = re.sub(r"[^a-z0-9 ]+", " ", (name or "").lower()).split()
+    while words and words[-1] in _SUFFIXES:
+        words.pop()
+    return " ".join(w for w in words if w != "the")
+
+
+def _family(market: str | None) -> str | None:
+    return "Europe" if market in ("Europe", "UK & Ireland") else market
+
+
+def dedupe(recs: dict[str, dict]) -> dict[str, dict]:
+    """One listing per company. Drops foreign listings of companies whose home market is covered elsewhere
+    (e.g. US stocks on Mexico's exchange), then keeps the best listing among same-name duplicates."""
+    keep = {}
+    for t, r in recs.items():
+        home = COUNTRY_MARKET.get(r.get("country"))
+        if r.get("region") not in ("us", "extra") and home and _family(home) != _family(r.get("mkt")):
+            continue
+        keep[t] = r
+    best: dict[str, str] = {}
+    for t, r in keep.items():
+        key = norm_name(r.get("name")) or t
+        if key not in best:
+            best[key] = t
+            continue
+        o = keep[best[key]]
+
+        def rank(x):
+            return (x.get("region") in ("us", "extra"), COUNTRY_MARKET.get(x.get("country")) == x.get("mkt"), x.get("_adv") or 0)
+
+        if rank(r) > rank(o):
+            best[key] = t
+    winners = set(best.values())
+    return {t: r for t, r in keep.items() if t in winners}
 
 
 # ---------------------------------------------------------------------------
@@ -387,9 +542,8 @@ def fetch_statements(ticker: str) -> dict:
     cf = with_retries(lambda: t.cashflow)
     return statement_metrics(inc, bal, cf)
 
-
 # ---------------------------------------------------------------------------
-# info (TTM snapshot) and prices
+# info (TTM snapshot), currency handling and prices
 # ---------------------------------------------------------------------------
 
 def fetch_info(ticker: str) -> dict:
@@ -398,29 +552,37 @@ def fetch_info(ticker: str) -> dict:
     return with_retries(lambda: yf.Ticker(ticker).info) or {}
 
 
-def info_fields(info: dict) -> dict:
-    mcap = num(info.get("marketCap"))
-    fcf = num(info.get("freeCashflow"))
-    rev = num(info.get("totalRevenue"))
-    de = num(info.get("debtToEquity"))
-    pe_y, peg_y = num(info.get("trailingPE")), num(info.get("trailingPegRatio") or info.get("pegRatio"))
-    debt, cash, ebitda = num(info.get("totalDebt")), num(info.get("totalCash")), num(info.get("ebitda"))
-    ev = num(info.get("enterpriseValue"))
+def _closest(cands: list, target):
+    """Pick the candidate nearest the target on a log scale (used to detect which currency Yahoo used)."""
+    cands = [c for c in cands if c is not None and c > 0]
+    if not cands:
+        return None
+    if target is None or target <= 0:
+        return cands[0]
+    return min(cands, key=lambda c: abs(math.log(c / target)))
+
+
+def info_fields(info: dict, fx: dict) -> dict:
+    """Normalise one Yahoo info dict. Prices stay in the listing currency; money totals become US dollars.
+
+    Yahoo is not consistent about currencies (pence vs pounds, ADRs priced in USD but reporting in TWD...),
+    so where it gives us a cross-check (its own P/E and P/S) we use it to pick the right conversion.
+    """
+    cur = info.get("currency") or "USD"
+    fin = info.get("financialCurrency") or base_ccy(cur)[0]
+    r_cur, r_fin = fx.get(cur), fx.get(fin)
     price = num(info.get("currentPrice") or info.get("regularMarketPrice"))
-    return {
+    out = {
         "name": info.get("shortName") or info.get("longName"),
         "sector": info.get("sector") or "Unknown",
         "industry": info.get("industry"),
+        "country": info.get("country"),
+        "cur": cur,
         "price": price,
-        "mcap": mcap,
         "fpe": num(info.get("forwardPE")),
-        "ps": num(info.get("priceToSalesTrailing12Months")),
         "roe": num(info.get("returnOnEquity")),
         "gm": num(info.get("grossMargins")),
         "om": num(info.get("operatingMargins")),
-        "fcfm": ratio(fcf, rev),
-        "de": de / 100 if de is not None else None,  # Yahoo reports D/E in percent
-        "nd_ebitda": ratio((debt or 0) - (cash or 0), ebitda) if ebitda and ebitda > 0 else None,
         "cur_ratio": num(info.get("currentRatio")),
         "rev_q": num(info.get("revenueGrowth")),
         "beta": num(info.get("beta")),
@@ -430,19 +592,56 @@ def info_fields(info: dict) -> dict:
         "inst": num(info.get("heldPercentInstitutions")),
         "short": num(info.get("shortPercentOfFloat")),
         "divy": num(info.get("trailingAnnualDividendYield")),
-        # base values so price-dependent ratios can be recomputed hourly
-        "_b": {
-            "eps": num(info.get("trailingEps")),
-            "fcf": fcf,
-            "rev": rev,
-            "ebitda": ebitda,
-            "ev_less_mcap": (ev - mcap) if ev is not None and mcap is not None else None,
-            "peg_g": (pe_y / peg_y) if pe_y and peg_y and peg_y > 0 else None,  # implied growth % behind Yahoo's PEG
-            "fpe_eps": (price / num(info.get("forwardPE"))) if price and num(info.get("forwardPE")) else None,
-            "target": num(info.get("targetMeanPrice")),
-            "mcap_px": price,
-        },
     }
+    de = num(info.get("debtToEquity"))
+    out["de"] = de / 100 if de is not None else None  # Yahoo reports D/E in percent
+    fcf, rev = num(info.get("freeCashflow")), num(info.get("totalRevenue"))
+    debt, cash, ebitda = num(info.get("totalDebt")), num(info.get("totalCash")), num(info.get("ebitda"))
+    out["fcfm"] = ratio(fcf, rev)
+    out["nd_ebitda"] = ratio((debt or 0) - (cash or 0), ebitda) if ebitda and ebitda > 0 else None
+    if r_cur is None or r_fin is None:
+        out["_b"] = {}
+        out["mcap"] = None  # can't convert: the market-cap test will report "no data"
+        return out
+
+    # market cap in USD: Yahoo's figure, unless shares x price disagrees wildly (pence/pounds mix-ups)
+    mc = num(info.get("marketCap"))
+    shares = num(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
+    from_shares = shares * price * r_cur if shares and price else None
+    cands = [mc * r_cur if mc else None, mc * fx.get(base_ccy(cur)[0], r_cur) if mc else None]
+    mcap = _closest(cands, from_shares)
+    if from_shares and (mcap is None or abs(math.log(mcap / from_shares)) > math.log(3)):
+        mcap = from_shares
+    out["mcap"] = mcap
+
+    # statement-currency totals -> USD. P/S cross-check tells us if Yahoo already used the listing currency
+    ps_y = num(info.get("priceToSalesTrailing12Months"))
+    r_money = r_fin
+    if rev and mcap and ps_y and ps_y > 0:
+        r_money = _closest([r_fin, r_cur], mcap / ps_y / rev) or r_fin
+    usd = (lambda v: v * r_money if v is not None else None)
+    # EPS -> listing currency. P/E cross-check catches ADRs where Yahoo quotes per-ADR EPS in dollars
+    eps, pe_y = num(info.get("trailingEps")), num(info.get("trailingPE"))
+    if eps is not None:
+        eps_conv = eps * r_fin / r_cur
+        if pe_y and price and eps > 0:
+            eps = _closest([eps, eps_conv], price / pe_y)
+        else:
+            eps = eps_conv
+    fpe = num(info.get("forwardPE"))
+    peg_y = num(info.get("trailingPegRatio") or info.get("pegRatio"))
+    out["_adv"] = (num(info.get("averageVolume")) or 0) * (price or 0) * r_cur
+    out["_b"] = {
+        "eps": eps,                                                         # listing currency
+        "fcf": usd(fcf), "rev": usd(rev), "ebitda": usd(ebitda),            # USD
+        "net_debt": usd((debt or 0) - (cash or 0)) if debt is not None or cash is not None else None,
+        "peg_g": (pe_y / peg_y) if pe_y and peg_y and peg_y > 0 else None,  # implied growth % behind Yahoo's PEG
+        "fpe_eps": (price / fpe) if price and fpe else None,               # listing currency
+        "target": num(info.get("targetMeanPrice")),                         # listing currency
+        "mcap_px": price,
+        "r_fin": r_fin,
+    }
+    return out
 
 
 def price_metrics(close: pd.Series) -> dict:
@@ -491,14 +690,13 @@ def download_prices(tickers: list[str], period="14mo") -> pd.DataFrame:
         frames.append(close)
     return pd.concat(frames, axis=1) if frames else pd.DataFrame()
 
-
 # ---------------------------------------------------------------------------
 # derived ratios, scoring, screening
 # ---------------------------------------------------------------------------
 
 def derive(rec: dict) -> None:
     """Recompute everything that depends on the current price. Used by both full and hourly runs."""
-    b, p = rec.get("_b", {}), rec.get("_p", {})
+    b, p = rec.get("_b") or {}, rec.get("_p") or {}
     price = num(rec.get("price"))
     if price is None:
         return
@@ -512,10 +710,9 @@ def derive(rec: dict) -> None:
     if b.get("fpe_eps") and b["fpe_eps"] > 0:
         rec["fpe"] = price / b["fpe_eps"]
     rec["fcf_yield"] = ratio(b.get("fcf"), mcap)
-    if b.get("rev") and mcap:
-        rec["ps"] = mcap / b["rev"]
-    if b.get("ebitda") and b["ebitda"] > 0 and mcap and b.get("ev_less_mcap") is not None:
-        rec["ev_ebitda"] = (mcap + b["ev_less_mcap"]) / b["ebitda"]
+    rec["ps"] = ratio(mcap, b.get("rev")) if b.get("rev") and b["rev"] > 0 else None
+    if b.get("ebitda") and b["ebitda"] > 0 and mcap and b.get("net_debt") is not None:
+        rec["ev_ebitda"] = (mcap + b["net_debt"]) / b["ebitda"]
     rec["upside"] = b["target"] / price - 1 if b.get("target") else None
     if p:
         for k, ref in (("chg1d", "prev"), ("perf3m", "p63"), ("perf6m", "p126"), ("perf12m", "p252")):
@@ -527,8 +724,8 @@ def derive(rec: dict) -> None:
         if p.get("ma200"):
             rec["dma200"] = price / p["ma200"] - 1
     z = rec.get("_z")
-    if z and z.get("tl") and z["tl"] > 0 and mcap and z.get("wc") is not None:
-        rec["zscore"] = 1.2 * z["wc"] + 1.4 * z["re"] + 3.3 * z["ebit"] + 0.6 * mcap / z["tl"] + 1.0 * z["sales"]
+    if z and z.get("tl_usd") and z["tl_usd"] > 0 and mcap and z.get("wc") is not None:
+        rec["zscore"] = 1.2 * z["wc"] + 1.4 * z["re"] + 3.3 * z["ebit"] + 0.6 * mcap / z["tl_usd"] + 1.0 * z["sales"]
 
 
 def criteria_spec() -> list[dict]:
@@ -586,8 +783,9 @@ def score_all(stocks: list[dict]) -> None:
     for s in stocks:
         s.pop("_ey", None)
 
-
 COVERAGE_KEYS = [c[0] for c in CRITERIA if c[5]]
+PRIVATE = ("_b", "_p", "_z", "_adv")          # kept in state.json for the hourly job, not sent to the browser
+DETAIL = ("_spark", "_dates", "revh")         # detail.json, loaded by the dashboard on demand
 
 
 def finalize(stocks: list[dict]) -> None:
@@ -600,7 +798,7 @@ def finalize(stocks: list[dict]) -> None:
     for s in stocks:
         for k, v in list(s.items()):
             if isinstance(v, float):
-                s[k] = rnd(v)
+                s[k] = sig(v) if abs(v) >= 1000 else rnd(v)
             elif isinstance(v, dict):
                 s[k] = {kk: sig(vv) for kk, vv in v.items()}
 
@@ -616,9 +814,15 @@ def update_history(stocks: list[dict], crit: list[dict], when: str) -> dict:
     return hist
 
 
-def public_record(s: dict) -> dict:
-    """What the dashboard gets: metrics plus the base values the hourly job needs."""
-    return {k: v for k, v in s.items() if k not in ("_spark", "_dates", "revh")}
+def write_outputs(head: dict, stocks: list[dict], detail: dict | None = None) -> None:
+    public = [{k: v for k, v in s.items() if k not in PRIVATE and k not in DETAIL} for s in stocks]
+    state = {s["t"]: {k: s[k] for k in PRIVATE if k in s} for s in stocks}
+    markets = sorted({s.get("mkt") for s in stocks if s.get("mkt")})
+    save_json(DATA / "screen.json", {**head, "criteria": criteria_spec(), "display": DISPLAY, "markets": markets,
+                                     "excluded_sectors": EXCLUDE_SECTORS, "stocks": public}, records=True)
+    save_json(DATA / "state.json", state)
+    if detail is not None:
+        save_json(DATA / "detail.json", detail)
 
 
 # ---------------------------------------------------------------------------
@@ -627,17 +831,23 @@ def public_record(s: dict) -> dict:
 
 def run_full(limit: int | None = None) -> None:
     t0 = time.time()
-    print("1/5 universe")
-    uni = get_universe()
+    print("1/6 currencies and universe")
+    fx = fx_rates(BASE_CCYS if INTERNATIONAL else [])
+    uni = us_universe()
+    for t in EXTRA_TICKERS:
+        uni.setdefault(t, {"region": "extra", "idx": "Extra"})
+    if INTERNATIONAL:
+        for t, v in intl_universe(fx).items():
+            uni.setdefault(t, v)
     tickers = sorted(uni)[:limit] if limit else sorted(uni)
-    print(f"    {len(tickers)} tickers")
+    print(f"    {len(tickers)} listings")
 
-    print("2/5 prices (batched)")
+    print("2/6 prices (batched)")
     closes = download_prices(tickers)
     print(f"    {closes.shape[1]} price series")
 
-    print("3/5 TTM snapshot (Yahoo info)")
-    recs: dict[str, dict] = {}
+    print("3/6 TTM snapshot (Yahoo info)")
+    infos: dict[str, dict] = {}
     failed = []
     with ThreadPoolExecutor(WORKERS) as ex:
         futs = {ex.submit(fetch_info, t): t for t in tickers}
@@ -645,62 +855,98 @@ def run_full(limit: int | None = None) -> None:
             t = futs[f]
             try:
                 info = f.result()
-                if info.get("quoteType") not in (None, "EQUITY"):
-                    continue
-                recs[t] = {"t": t, "idx": uni[t], **info_fields(info)}
+                if info.get("quoteType") in (None, "EQUITY"):
+                    infos[t] = info
             except Exception as e:
                 failed.append(t)
                 print(f"    ! {t}: {type(e).__name__}", file=sys.stderr)
-            if i % 250 == 0:
-                print(f"    {i}/{len(tickers)}")
+            if i % 500 == 0:
+                print(f"    {i}/{len(tickers)}  ({time.time() - t0:.0f}s)")
+    fx = fx_rates({c for i in infos.values() for c in (i.get("currency"), i.get("financialCurrency"))} - {None}, fx)
+
+    recs: dict[str, dict] = {}
+    for t, info in infos.items():
+        u = uni[t]
+        r = {"t": t, "idx": u.get("idx") or (info.get("fullExchangeName") or info.get("exchange")),
+             "region": u["region"], **info_fields(info, fx)}
+        r["mkt"] = MARKET_OF_REGION.get(u["region"]) or COUNTRY_MARKET.get(r.get("country")) or "Other"
+        if u["region"] not in ("us", "extra") and (r.get("mcap") or 0) < INTL_MIN_MCAP_USD:
+            continue
+        recs[t] = r
+    before = len(recs)
+    recs = dedupe(recs)
+    print(f"    {len(recs)} stocks after removing {before - len(recs)} duplicate/foreign listings")
 
     for t, r in recs.items():
         if t in closes.columns:
             r.update(price_metrics(closes[t]))
-        r["_b"]["mcap_px"] = r["_b"]["mcap_px"] or r.get("price")
+        if r.get("_b") is not None:
+            r["_b"]["mcap_px"] = r["_b"].get("mcap_px") or r.get("price")
 
-    print("4/5 annual statements (cached weekly)")
+    print("4/6 annual statements (cached weekly, biggest companies first)")
     cache = load_json(CACHE / "fundamentals.json", {})
     today = dt.date.today()
-    need = [t for t, r in recs.items()
-            if r.get("sector") not in EXCLUDE_SECTORS and (r.get("mcap") or 0) >= STATEMENT_MIN_MCAP
-            and (t not in cache or (today - dt.date.fromisoformat(cache[t]["_at"])).days >= STATEMENT_MAX_AGE_DAYS)]
-    print(f"    {len(need)} to refresh, {len(cache)} cached")
+
+    def age(t):
+        return (today - dt.date.fromisoformat(cache[t]["_at"])).days if t in cache else 10 ** 6
+
+    eligible = [t for t, r in recs.items()
+                if r.get("sector") not in EXCLUDE_SECTORS and (r.get("mcap") or 0) >= STATEMENT_MIN_MCAP
+                and age(t) >= STATEMENT_MAX_AGE_DAYS]
+    eligible.sort(key=lambda t: (t in cache, -age(t), -(recs[t].get("mcap") or 0)))  # missing first, then stalest
+    need = eligible[:STATEMENT_BUDGET]
+    print(f"    {len(eligible)} due, pulling {len(need)} this run, {len(cache)} cached")
+    deadline = t0 + TIME_BUDGET_MIN * 60
+    done = 0
     with ThreadPoolExecutor(WORKERS) as ex:
-        futs = {ex.submit(fetch_statements, t): t for t in need}
-        for i, f in enumerate(as_completed(futs), 1):
-            t = futs[f]
-            try:
-                cache[t] = {**f.result(), "_at": today.isoformat()}
-            except Exception as e:
-                print(f"    ! statements {t}: {type(e).__name__}", file=sys.stderr)
-            if i % 250 == 0:
-                print(f"    {i}/{len(need)}")
+        for start in range(0, len(need), 100):
+            if time.time() > deadline:
+                print(f"    time budget reached; the rest will be pulled on the next run")
+                break
+            batch = need[start:start + 100]
+            futs = {ex.submit(fetch_statements, t): t for t in batch}
+            for f in as_completed(futs):
+                t = futs[f]
+                try:
+                    cache[t] = {**f.result(), "_at": today.isoformat()}
+                    done += 1
+                except Exception as e:
+                    print(f"    ! statements {t}: {type(e).__name__}", file=sys.stderr)
+            if start % 500 == 0:
+                print(f"    {start + len(batch)}/{len(need)}  ({time.time() - t0:.0f}s)")
                 save_json(CACHE / "fundamentals.json", cache)
     save_json(CACHE / "fundamentals.json", cache)
     for t, r in recs.items():
         if t in cache:
-            r.update({k: v for k, v in cache[t].items() if k != "_at"})
+            st = {k: v for k, v in cache[t].items() if k != "_at"}
+            r_fin = (r.get("_b") or {}).get("r_fin")
+            if r_fin:  # statements are in the reporting currency
+                if st.get("revh"):
+                    st["revh"] = [[y, round(v * r_fin)] for y, v in st["revh"]]
+                if st.get("_z"):
+                    st["_z"] = {**st["_z"], "tl_usd": (st["_z"].get("tl") or 0) * r_fin}
+            r.update(st)
 
-    print("5/5 scoring and writing")
+    print("5/6 scoring")
     stocks = sorted(recs.values(), key=lambda r: r["t"])
     finalize(stocks)
     crit = criteria_spec()
     when = now_utc()
+
+    print("6/6 writing")
     detail = {s["t"]: {"spark": s.get("_spark"), "dates": s.get("_dates"), "revh": s.get("revh")} for s in stocks}
     history = update_history(stocks, crit, when)
-    save_json(DATA / "screen.json", {
+    n_intl = sum(s["region"] != "us" for s in stocks)
+    write_outputs({
         "generated": when, "prices_updated": when, "demo": False,
-        "universe": "S&P 500 + 400 + 600", "excluded_sectors": EXCLUDE_SECTORS,
-        "criteria": criteria_spec(), "display": DISPLAY,
-        "stats": {"tickers": len(tickers), "loaded": len(stocks), "failed": len(failed)},
-        "stocks": [public_record(s) for s in stocks],
-    }, records=True)
-    save_json(DATA / "detail.json", detail)
+        "universe": "S&P 1500" + (f" + {n_intl:,} international" if n_intl else ""),
+        "stats": {"listings": len(tickers), "loaded": len(stocks), "failed": len(failed),
+                  "statements_cached": len(cache), "statements_pulled": done},
+    }, stocks, detail)
     save_json(DATA / "history.json", history)
     n = sum(passes(s, crit) for s in stocks)
     print(f"done in {time.time() - t0:.0f}s: {len(stocks)} stocks, {n} pass the default screen, {len(failed)} failed")
-    if len(stocks) < 0.5 * len(tickers):
+    if len(infos) < 0.5 * len(tickers):
         raise SystemExit("Fewer than half the tickers loaded; Yahoo may be rate limiting. Data was still written.")
 
 
@@ -708,7 +954,10 @@ def run_prices() -> None:
     screen = load_json(DATA / "screen.json", None)
     if not screen or screen.get("demo"):
         raise SystemExit("No real screen.json yet. Run `python screener.py full` first.")
+    state = load_json(DATA / "state.json", {})
     stocks = screen["stocks"]
+    for s in stocks:
+        s.update(state.get(s["t"], {}))
     closes = download_prices([s["t"] for s in stocks], period="5d")
     updated = 0
     for s in stocks:
@@ -724,8 +973,9 @@ def run_prices() -> None:
             s["_p"]["prev"] = float(col.iloc[-2])
         updated += 1
     finalize(stocks)
-    screen["prices_updated"] = now_utc()
-    save_json(DATA / "screen.json", screen, records=True)
+    head = {k: v for k, v in screen.items() if k not in ("stocks", "criteria", "display", "markets", "excluded_sectors")}
+    head["prices_updated"] = now_utc()
+    write_outputs(head, stocks)
     print(f"refreshed {updated}/{len(stocks)} prices")
 
 

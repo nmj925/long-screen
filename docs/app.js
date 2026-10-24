@@ -10,7 +10,7 @@
   const STORE = "longscreen.v1";
 
   const S = {
-    data: null, history: { days: [] }, detail: null, crit: [], defaults: [], excluded: new Set(), sectors: [],
+    data: null, history: { days: [] }, detail: null, crit: [], defaults: [], excluded: new Set(), sectors: [], exMkts: new Set(),
     view: "pass", q: "", sort: { key: "score", dir: -1 }, watch: new Set(), showAll: false, rows: [],
   };
 
@@ -26,6 +26,15 @@
       case "x": return v >= 999 ? "no debt" : Math.abs(v) < 10 ? v.toFixed(2) : v.toFixed(1);
       default: return v.toFixed(2);
     }
+  }
+  const CUR_SYM = { USD: "$", EUR: "€", GBP: "£", JPY: "¥", CNY: "¥", INR: "₹", KRW: "₩", GBp: "p" };
+  function money(v, cur) {
+    if (!isNum(v)) return "–";
+    cur = cur || "USD";
+    const n = v.toLocaleString(undefined, { maximumFractionDigits: v >= 1000 ? 0 : 2, minimumFractionDigits: v >= 1000 ? 0 : 2 });
+    if (cur === "GBp") return n + "p";
+    const sym = CUR_SYM[cur];
+    return sym ? sym + n : n + " " + cur;
   }
   const unit = (c) => (c.fmt === "pct" ? "%" : c.fmt === "usd" ? "$B" : c.fmt === "x" ? "×" : "");
   const toInput = (c, v) => (c.fmt === "pct" ? +(v * 100).toFixed(2) : c.fmt === "usd" ? +(v / 1e9).toFixed(2) : v);
@@ -52,7 +61,7 @@
     try {
       localStorage.setItem(STORE, JSON.stringify({
         crit: Object.fromEntries(S.crit.map((c) => [c.key, { on: c.on, value: c.value }])),
-        excluded: [...S.excluded], watch: [...S.watch], view: S.view, sort: S.sort,
+        excluded: [...S.excluded], exMkts: [...S.exMkts], watch: [...S.watch], view: S.view, sort: S.sort,
       }));
     } catch { /* storage unavailable: settings last for this visit only */ }
   }
@@ -79,7 +88,7 @@
         s._res[c.key] = r;
         if (r !== true) fails++;
       }
-      s._sectorOk = !S.excluded.has(s.sector);
+      s._sectorOk = !S.excluded.has(s.sector) && !S.exMkts.has(s.mkt || "US");
       s._fails = fails;
       s._pass = s._sectorOk && fails === 0;
       s._near = s._sectorOk && fails === 1;
@@ -116,6 +125,7 @@
     S.sectors = [...new Set(S.data.stocks.map((s) => s.sector))].sort();
     S.excluded = new Set(prefs.excluded || S.data.excluded_sectors || []);
     S.watch = new Set(prefs.watch || []);
+    S.exMkts = new Set(prefs.exMkts || []);
     if (prefs.view) S.view = prefs.view;
     if (prefs.sort) S.sort = prefs.sort;
 
@@ -143,6 +153,7 @@
     renderFunnel();
     renderGroups();
     renderSectors();
+    renderMarkets();
     renderScatter();
     renderSectorBars();
     renderHistory();
@@ -165,7 +176,7 @@
     const since = prev ? `since ${new Date(prev.date + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" })}` : "after the second run";
     $("#tiles").innerHTML = `
       <div class="card tile hero"><span class="label">Passing now</span><span class="v">${pass.length}</span>
-        <span class="d">of ${eligible.toLocaleString()} eligible stocks (${eligible ? ((pass.length / eligible) * 100).toFixed(1) : 0}%)</span></div>
+        <span class="d">of ${eligible.toLocaleString()} stocks in scope (${eligible ? ((pass.length / eligible) * 100).toFixed(1) : 0}%)</span></div>
       <div class="card tile"><span class="label">New entries</span><span class="v">${added.length}</span><span class="d">${since}, default criteria</span>${ticks(added, "up")}</div>
       <div class="card tile"><span class="label">Dropped out</span><span class="v">${dropped.length}</span><span class="d">${since}, default criteria</span>${ticks(dropped, "down")}</div>
       <div class="card tile"><span class="label">Typical passing name</span>
@@ -209,6 +220,16 @@
         ${c.op === "pe_or_peg" ? `<span class="hint">set above</span>` : control(c, false)}</div>`).join("")}</div>`).join("");
   }
 
+  function renderMarkets() {
+    const counts = {};
+    S.data.stocks.forEach((s) => (counts[s.mkt || "US"] = (counts[s.mkt || "US"] || 0) + 1));
+    const mkts = (S.data.markets && S.data.markets.length ? S.data.markets : Object.keys(counts)).slice()
+      .sort((a, b) => (a === "US" ? -1 : b === "US" ? 1 : (counts[b] || 0) - (counts[a] || 0)));
+    $("#markets-row").hidden = mkts.length < 2;
+    $("#markets").innerHTML = mkts.map((m) =>
+      `<button type="button" class="chip" data-mkt="${esc(m)}" aria-pressed="${!S.exMkts.has(m)}">${esc(m)} <span class="hint">${(counts[m] || 0).toLocaleString()}</span></button>`).join("");
+  }
+
   function renderSectors() {
     const counts = {};
     S.data.stocks.forEach((s) => (counts[s.sector] = (counts[s.sector] || 0) + 1));
@@ -236,6 +257,9 @@
     return out;
   };
 
+  // draw at most n background points (deterministic, so the chart doesn't shimmer between renders)
+  const thin = (arr, n) => (arr.length <= n ? arr : arr.filter((_, i) => i % Math.ceil(arr.length / n) === 0));
+
   function renderScatter() {
     const el = $("#scatter");
     const W = Math.max(300, el.clientWidth || 600), H = Math.round(Math.min(420, Math.max(260, W * 0.55)));
@@ -259,7 +283,7 @@
       svg += `<text class="lbl" x="${x1 + 4}" y="${m.t + 12}">P/E ${peC.value[0]}</text><text class="lbl" x="${W - m.r}" y="${y1 - 5}" text-anchor="end">ROIC ${Math.round(roicC.value * 100)}%</text>`;
     }
     const groups = [
-      [pts.filter((s) => !s._pass && !s._near), "var(--other)", 2.5, false],
+      [thin(pts.filter((s) => !s._pass && !s._near), 2500), "var(--other)", 2.5, false],
       [pts.filter((s) => s._near), "var(--s2)", 4, true],
       [pts.filter((s) => s._pass), "var(--s1)", 4.5, true],
     ];
@@ -386,9 +410,9 @@
   function columns() {
     const cols = [
       { key: "score", label: "Score", fmt: "int", score: true },
-      { key: "price", label: "Price", fmt: "usd2" },
+      { key: "price", label: "Price", money: true },
       { key: "chg1d", label: "1D", fmt: "pct", signed: true },
-      { key: "mcap", label: "Mkt cap", fmt: "usd", crit: "mcap" },
+      { key: "mcap", label: "Mkt cap ($)", fmt: "usd", crit: "mcap" },
     ];
     for (const c of S.crit.filter((c) => c.on && c.key !== "mcap")) {
       if (c.op === "pe_or_peg") {
@@ -424,7 +448,7 @@
     else if (S.view === "watch") rows = rows.filter((s) => S.watch.has(s.t));
     if (S.q) {
       const q = S.q.toLowerCase();
-      rows = rows.filter((s) => s.t.toLowerCase().includes(q) || (s.name || "").toLowerCase().includes(q));
+      rows = rows.filter((s) => s.t.toLowerCase().includes(q) || (s.name || "").toLowerCase().includes(q) || (s.country || "").toLowerCase().includes(q));
     }
     const { key, dir } = S.sort;
     return [...rows].sort((a, b) => {
@@ -453,7 +477,7 @@
       pass: "Every active test passes. Sorted by composite score unless you pick a column.",
       near: "Fails exactly one test, shown in red. Good places to look when a single number is distorted by a one-off.",
       watch: "Stars you add are saved in this browser.",
-      all: "Every stock in the universe, including excluded sectors. Red cells fail a test.",
+      all: "Every stock loaded, including excluded sectors and markets. Prices are in local currency; market caps in US dollars.",
     };
     $("#res-note").textContent = notes[S.view];
     const sortAttr = (k) => (S.sort.key === k ? ` aria-sort="${S.sort.dir < 0 ? "descending" : "ascending"}"` : "");
@@ -464,6 +488,7 @@
       const cells = cols.map((c) => {
         if (c.spark) return `<td>${spark(s.t)}</td>`;
         const v = s[c.key];
+        if (c.money) return `<td>${money(v, s.cur)}</td>`;
         if (c.score) return `<td><span class="score"><span class="bar"><i style="width:${isNum(v) ? v : 0}%"></i></span>${isNum(v) ? v : "–"}</span></td>`;
         let cls = "";
         if (c.crit && s._res && c.crit in s._res) {
@@ -475,7 +500,7 @@
         return `<td class="${cls}">${fmt(c.fmt, v)}</td>`;
       }).join("");
       return `<tr data-t="${esc(s.t)}"><td class="l"><button type="button" class="star" data-star="${esc(s.t)}" aria-pressed="${S.watch.has(s.t)}" aria-label="Watch ${esc(s.t)}">★</button></td>
-        <td class="l sticky"><span class="tk">${esc(s.t)}</span><span class="nm">${esc(s.name)}</span></td>${cells}</tr>`;
+        <td class="l sticky"><span class="tk">${esc(s.t)}</span>${s.mkt && s.mkt !== "US" ? `<span class="mk">${esc(s.country || s.mkt)}</span>` : ""}<span class="nm">${esc(s.name)}</span></td>${cells}</tr>`;
     }).join("");
     const empty = !rows.length ? `<tr><td class="l" colspan="${cols.length + 2}"><p class="empty">${S.view === "watch" ? "Star a row to add it here." : "No matches. Loosen a criterion or clear the search."}</p></td></tr>` : "";
     const more = rows.length > limit ? `<tr><td class="l" colspan="${cols.length + 2}"><p class="hint">Showing the first ${limit} of ${rows.length}. Search or sort to narrow down.</p></td></tr>` : "";
@@ -504,15 +529,17 @@
     const extras = [["P/E (trailing)", "x", s.pe], ["PEG", "x", s.peg], ["3-month return", "pct", s.perf3m], ["12-month return", "pct", s.perf12m],
       ["Dividend yield", "pct", s.divy], ["Institutional ownership", "pct", s.inst], ["Analysts covering", "int", s.analysts],
       ["Data coverage (core metrics)", "pct", s.coverage]];
-    const links = S.data.demo ? `<p class="hint">Links to Yahoo Finance, TradingView and SEC filings appear here with real data.</p>` : `<div class="links">
+    const us = (s.region || "us") === "us" || (!t.includes(".") && (s.mkt || "US") === "US");
+    const links = S.data.demo ? `<p class="hint">Links to Yahoo Finance, TradingView and filings appear here with real data.</p>` : `<div class="links">
       <a href="https://finance.yahoo.com/quote/${encodeURIComponent(t)}" target="_blank" rel="noopener">Yahoo Finance</a>
-      <a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(t.replace("-", "."))}" target="_blank" rel="noopener">TradingView chart</a>
-      <a href="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${encodeURIComponent(t.replace("-", "."))}&type=10-K" target="_blank" rel="noopener">10-K filings</a></div>`;
+      ${us ? `<a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(t.replace("-", "."))}" target="_blank" rel="noopener">TradingView chart</a>
+      <a href="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${encodeURIComponent(t.replace("-", "."))}&type=10-K" target="_blank" rel="noopener">10-K filings</a>`
+      : `<a href="https://www.google.com/search?q=${encodeURIComponent((s.name || t) + " annual report investor relations")}" target="_blank" rel="noopener">Annual report search</a>`}</div>`;
     $("#d-body").innerHTML = `
-      <div class="d-head"><span class="tkr">${esc(t)} · ${esc(s.idx || "")}</span><h2 id="d-title">${esc(s.name)}</h2>
+      <div class="d-head"><span class="tkr">${esc(t)} · ${esc(s.idx || "")}${s.country ? " · " + esc(s.country) : ""}</span><h2 id="d-title">${esc(s.name)}</h2>
         <span class="hint">${esc(s.sector)}${s.industry && s.industry !== s.sector ? " · " + esc(s.industry) : ""}${s.fy_end ? " · last annual report " + esc(s.fy_end) : ""}</span></div>
-      <div class="d-price"><span class="p">${fmt("usd2", s.price)}</span><span class="${(s.chg1d ?? 0) >= 0 ? "pos" : "neg"}">${fmt("pct", s.chg1d)} today</span>
-        <span class="hint">${fmt("usd", s.mcap)} market cap</span>${verdict}
+      <div class="d-price"><span class="p">${money(s.price, s.cur)}</span><span class="${(s.chg1d ?? 0) >= 0 ? "pos" : "neg"}">${fmt("pct", s.chg1d)} today</span>
+        <span class="hint">${fmt("usd", s.mcap)} market cap (USD)</span>${verdict}
         <button type="button" class="star" data-star="${esc(t)}" aria-pressed="${S.watch.has(t)}" aria-label="Watch ${esc(t)}" style="font-size:18px">★</button></div>
       <div class="subscores">${["quality", "growth", "value", "momentum"].map((k) => `<div><span class="label">${k}</span><div class="v">${sub[k] ?? "–"}</div></div>`).join("")}</div>
       <p class="hint" style="margin:0">Composite score ${s.score ?? "–"}/100. Each part is a percentile rank against eligible stocks.</p>
@@ -530,7 +557,7 @@
       if (d.spark && d.spark.length > 2 && d.dates) {
         const end = new Date(d.dates[1] + "T12:00:00");
         const pts = d.spark.map((y, i) => ({ x: new Date(end.getTime() - (d.spark.length - 1 - i) * 7 * 864e5), y }));
-        lineChart(pe, pts, { aria: "Weekly price, one year", color: "var(--s1)", yfmt: (v, full) => "$" + (full ? v.toFixed(2) : v >= 100 ? Math.round(v) : v.toFixed(0)), h: 170 });
+        lineChart(pe, pts, { aria: "Weekly price, one year", color: "var(--s1)", yfmt: (v, full) => (full ? money(v, s.cur) : money(Math.round(v), s.cur).replace(/\.00$/, "")), h: 170 });
       } else pe.innerHTML = `<p class="empty">No price history.</p>`;
       revBars($("#d-rev"), d.revh || []);
       $("#d-close").focus();
@@ -561,8 +588,8 @@
   // ---------- CSV ----------
   function exportCSV() {
     const cols = columns().filter((c) => !c.spark);
-    const head = ["Ticker", "Name", "Sector", ...cols.map((c) => c.label), "Passes", "Failed tests"];
-    const lines = S.rows.map((s) => [s.t, s.name, s.sector, ...cols.map((c) => (isNum(s[c.key]) ? s[c.key] : "")), s._pass ? "yes" : "no",
+    const head = ["Ticker", "Name", "Country", "Market", "Currency", "Sector", ...cols.map((c) => c.label), "Passes", "Failed tests"];
+    const lines = S.rows.map((s) => [s.t, s.name, s.country || "", s.mkt || "US", s.cur || "USD", s.sector, ...cols.map((c) => (isNum(s[c.key]) ? s[c.key] : "")), s._pass ? "yes" : "no",
       S.crit.filter((c) => c.on && s._res[c.key] !== true).map((c) => c.label).join("; ")]);
     const csv = [head, ...lines].map((r) => r.map((v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v)).join(",")).join("\n");
     const a = document.createElement("a");
@@ -611,6 +638,10 @@
         savePrefs();
         if (S.view === "watch") renderTable();
         else $$("#tabs button").find((b) => b.dataset.view === "watch").querySelector(".count").textContent = S.watch.size;
+      } else if (el.dataset.mkt) {
+        const m = el.dataset.mkt;
+        S.exMkts.has(m) ? S.exMkts.delete(m) : S.exMkts.add(m);
+        rerender();
       } else if (el.dataset.sector && el.classList.contains("chip")) {
         const sec = el.dataset.sector;
         S.excluded.has(sec) ? S.excluded.delete(sec) : S.excluded.add(sec);
@@ -630,6 +661,7 @@
     $("#reset").addEventListener("click", () => {
       S.crit = S.defaults.map((c) => ({ ...c, value: Array.isArray(c.value) ? [...c.value] : c.value }));
       S.excluded = new Set(S.data.excluded_sectors || []);
+      S.exMkts = new Set();
       rerender();
     });
     $("#q").addEventListener("input", (ev) => { S.q = ev.target.value.trim(); renderTable(); });

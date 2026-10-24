@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import screener as S  # noqa: E402
 
+FX = {"USD": 1.0, "JPY": 0.0067, "GBP": 1.30, "GBp": 0.013, "TWD": 0.031, "EUR": 1.08}
 DATES = pd.to_datetime(["2025-12-31", "2024-12-31", "2023-12-31", "2022-12-31"])
 
 
@@ -89,7 +90,7 @@ def base_record(**kw):
             "ebitda": 5e9, "totalDebt": 4e9, "totalCash": 6e9, "enterpriseValue": 48e9, "targetMeanPrice": 120,
             "sector": "Technology", "forwardPE": 18}
     info.update(kw)
-    return {"t": "TEST", **S.info_fields(info)}
+    return {"t": "TEST", **S.info_fields(info, FX)}
 
 
 def test_info_and_derive():
@@ -101,7 +102,7 @@ def test_info_and_derive():
     assert r["peg"] == pytest.approx(1.6)
     assert r["fcf_yield"] == pytest.approx(0.06)
     assert r["upside"] == pytest.approx(0.2)
-    assert r["ev_ebitda"] == pytest.approx(48 / 5)
+    assert r["ev_ebitda"] == pytest.approx((50 - 2) / 5)
     # hourly: price moves 10% -> price ratios follow
     r["price"] = 110
     S.derive(r)
@@ -138,3 +139,86 @@ def test_finalize_scores_and_rounds():
     assert scores[-1] > scores[0]
     assert all(set(s["sub"]) == {"quality", "growth", "value", "momentum"} for s in stocks)
     assert not any(isinstance(v, float) and not math.isfinite(v) for s in stocks for v in s.values())
+
+
+def test_foreign_listing_converts_to_usd():
+    # Japanese stock: price in yen, statements in yen
+    r = base_record(currency="JPY", financialCurrency="JPY", currentPrice=3000, marketCap=3e12, sharesOutstanding=1e9,
+                    trailingEps=150, trailingPE=20, freeCashflow=2e11, totalRevenue=2e12, ebitda=4e11,
+                    totalDebt=1e11, totalCash=3e11, priceToSalesTrailing12Months=1.5, targetMeanPrice=3300)
+    S.derive(r)
+    assert r["mcap"] == pytest.approx(3e12 * 0.0067)
+    assert r["pe"] == pytest.approx(20)
+    assert r["fcf_yield"] == pytest.approx(2e11 / 3e12)
+    assert r["ps"] == pytest.approx(1.5)
+    assert r["upside"] == pytest.approx(0.1)
+
+
+def test_pence_listing():
+    # London: price in pence, market cap and statements in pounds
+    r = base_record(currency="GBp", financialCurrency="GBP", currentPrice=2500, marketCap=25e9, sharesOutstanding=1e9,
+                    trailingEps=1.25, trailingPE=20, freeCashflow=1.5e9, totalRevenue=10e9,
+                    priceToSalesTrailing12Months=2.5)
+    S.derive(r)
+    assert r["mcap"] == pytest.approx(25e9 * 1.30, rel=0.01)   # not 100x too small
+    assert r["pe"] == pytest.approx(20, rel=0.01)                # EPS converted to pence
+    assert r["fcf_yield"] == pytest.approx(0.06, rel=0.01)
+
+
+def test_adr_with_foreign_statements():
+    # ADR priced in USD, Yahoo EPS already per ADR in USD, revenue in TWD
+    r = base_record(currency="USD", financialCurrency="TWD", currentPrice=200, marketCap=1e12, sharesOutstanding=5e9,
+                    trailingEps=8, trailingPE=25, freeCashflow=1e12, totalRevenue=3e12,
+                    priceToSalesTrailing12Months=1e12 / (3e12 * 0.031))
+    S.derive(r)
+    assert r["pe"] == pytest.approx(25)                          # EPS left alone (P/E cross-check)
+    assert r["ps"] == pytest.approx(1e12 / (3e12 * 0.031), rel=0.01)
+    assert r["fcf_yield"] == pytest.approx(1e12 * 0.031 / 1e12, rel=0.01)
+
+
+def test_missing_fx_means_no_mcap():
+    r = base_record(currency="XYZ", financialCurrency="XYZ")
+    assert r["mcap"] is None
+
+
+def test_dedupe():
+    recs = {
+        "SHEL.L": {"name": "Shell plc", "country": "United Kingdom", "region": "gb", "mkt": "UK & Ireland", "_adv": 5e8},
+        "SHELL.AS": {"name": "Shell PLC", "country": "United Kingdom", "region": "nl", "mkt": "Europe", "_adv": 2e8},
+        "AAPL": {"name": "Apple Inc.", "country": "United States", "region": "us", "mkt": "US"},
+        "AAPL.MX": {"name": "Apple Inc.", "country": "United States", "region": "mx", "mkt": "Latin America"},
+        "XYZ.MX": {"name": "Some US Co", "country": "United States", "region": "mx", "mkt": "Latin America"},
+        "0700.HK": {"name": "Tencent Holdings Ltd", "country": "China", "region": "hk", "mkt": "China & HK"},
+        "STLAM.MI": {"name": "Stellantis N.V.", "country": "Netherlands", "region": "it", "mkt": "Europe"},
+        "LIN": {"name": "Linde plc", "country": "Ireland", "region": "us", "mkt": "US"},
+    }
+    out = S.dedupe(recs)
+    assert set(out) == {"SHEL.L", "AAPL", "0700.HK", "STLAM.MI", "LIN"}
+
+
+def test_intl_universe_pages_until_below_floor(monkeypatch):
+    import yfinance as yf
+
+    calls = []
+
+    def fake_screen(q, offset=0, size=250, sortField=None, sortAsc=None):
+        region = q.to_dict()["operands"][0]["operands"][1]
+        calls.append((region, offset))
+        if region != "jp":
+            return {"quotes": [], "total": 0}
+        caps = [1e13 / (i + 1) for i in range(offset, offset + 250)]  # yen, descending
+        return {"total": 4000, "quotes": [{"symbol": f"{i}.T", "marketCap": c, "currency": "JPY", "quoteType": "EQUITY"}
+                                          for i, c in zip(range(offset, offset + 250), caps)]}
+
+    monkeypatch.setattr(yf, "screen", fake_screen)
+    monkeypatch.setattr(S, "INTL_EXCHANGES", {"jp": ["JPX"], "de": ["GER"]})
+    out = S.intl_universe({"USD": 1, "JPY": 0.0067})
+    floor = S.INTL_MIN_MCAP_USD * 0.5
+    expected = sum(1 for i in range(4000) if 1e13 / (i + 1) * 0.0067 >= floor)
+    assert len(out) == expected and all(v["region"] == "jp" for v in out.values())
+    assert len([c for c in calls if c[0] == "jp"]) < 16   # stopped paging early
+
+
+def test_norm_name():
+    assert S.norm_name("Shell plc") == S.norm_name("SHELL PLC") == "shell"
+    assert S.norm_name("Toyota Motor Corporation") == "toyota motor"

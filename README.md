@@ -1,10 +1,14 @@
 # Long Screen
 
-A long-hold stock screener with its own dashboard. It runs free on GitHub: prices refresh hourly during US market hours, and fundamentals refresh every weekday after the close. You don't need TradingView Premium or a paid data feed.
+A long-hold stock screener with its own dashboard, covering about 8,000 stocks worldwide. It runs free on GitHub: prices refresh every hour on weekdays, and fundamentals refresh every weekday after the US close. You don't need TradingView Premium or a paid data feed.
 
-- **Universe:** S&P 500 + 400 + 600 (about 1,500 US stocks), with room to add your own tickers.
+- **Universe:**
+  - **US:** the S&P 500 + 400 + 600, about 1,500 stocks.
+  - **International:** every stock worth **$2B or more** on the main exchange of about 50 countries. That includes Canada, the UK, the main European markets, Japan, China, Hong Kong, India, Korea, Taiwan, Australia, Southeast Asia, Latin America, the Middle East and South Africa.
+  - **Duplicate listings removed.** Shell in London and Amsterdam, or US stocks listed on Mexico's exchange, appear only once.
+- **Currencies:** prices are shown in each stock's local currency. Market caps and cash-flow figures are converted to US dollars, so the tests compare like with like.
 - **Data:** Yahoo Finance via `yfinance`, using TTM figures plus four years of annual statements.
-- **Dashboard:** a static web page (`docs/`) hosted free on GitHub Pages. It works on a phone too.
+- **Dashboard:** a static web page hosted free on GitHub Pages. It works on a phone too.
 
 ## What it screens
 
@@ -27,68 +31,80 @@ There are **28 more metrics** you can switch on with one click in the dashboard:
 - **Valuation:** forward P/E, EV/EBITDA, FCF yield, price/sales
 - **Growth:** EPS 3Y CAGR, years of revenue growth, latest-quarter revenue growth
 - **Profitability:** ROIC multi-year average, ROE, worst-year gross margin, operating margin, years of positive FCF
-- **Balance sheet:** net debt/EBITDA, interest coverage, current ratio, share count change (dilution or buybacks)
+- **Balance sheet:** net debt/EBITDA, interest coverage, current ratio, share count change
 - **Quality scores:** Piotroski F-score (0–9), Altman Z-score
 - **Momentum and risk:** 6-month return, price vs 200-day average, distance from 52-week high, volatility, 1Y max drawdown, beta
 - **Street and ownership:** analyst target upside, analyst rating, insider ownership, short interest
 
-Every stock also gets a **composite score** from 0 to 100: quality 35%, growth 25%, value 25% and momentum 15%. Each part is a percentile rank against the eligible universe. By default, the Passing table is sorted by this score.
+The dashboard also has **Markets** and **Sectors** filters, so you can look at Japan only, or everything except China, for example.
+
+Every stock gets a **composite score** from 0 to 100: quality 35%, growth 25%, value 25% and momentum 15%. Each part is a percentile rank against the eligible universe.
 
 ### How the main numbers are computed
 
-- **ROIC** = EBIT × (1 − effective tax rate) ÷ (total debt + equity − cash). The tax rate comes from the same year and is clamped to 0–35%, with 21% used if it's missing. Unlike ROE, debt can't inflate it.
-- **3Y CAGRs** compare the latest fiscal year with the one three years earlier. If either end is negative, the CAGR is left blank, because a growth rate from a loss means nothing.
-- **12-1 momentum** is the return from 12 months ago to 1 month ago. It skips the latest month, which tends to reverse.
-- **Missing data counts as a fail.** In the table it's grey and marked "no data". The *Near misses* tab shows stocks that fail exactly one test, which is where a one-off distortion usually shows up.
-- The hourly job recomputes all price-dependent figures from the stored base values: P/E, PEG, forward P/E, market cap, FCF yield, P/S, EV/EBITDA, analyst upside, returns, 52-week high distance, 200-day trend and the Z-score. Fundamentals only change on the daily run.
+- **ROIC** = EBIT × (1 − effective tax rate) ÷ (total debt + equity − cash).
+- **3Y CAGRs** compare the latest fiscal year with the one three years earlier. If either end is negative, the CAGR is left blank.
+- **12-1 momentum** is the return from 12 months ago to 1 month ago.
+- **Missing data counts as a fail.** The *Near misses* tab shows stocks that fail exactly one test.
+- **Currency checks:** Yahoo isn't consistent about currencies. It mixes pence and pounds on London stocks, and some ADRs are priced in dollars but report in other currencies. Where Yahoo gives its own P/E or P/S as a cross-check, the screener uses it to pick the right conversion.
+- **Hourly updates** recompute everything that depends on price. Fundamentals only change on the daily run.
 
-## Setup (about 10 minutes)
+## Setup
 
-1. **Create a repository** on github.com, for example `long-screen`. It must be **Public** to get free GitHub Pages hosting. Nothing private is stored in it.
-2. **Upload this folder.** Use *Add file → Upload files* and drag in everything, including the hidden `.github` folder. Or use git:
-   ```bash
-   git init && git add . && git commit -m "Long Screen"
-   git branch -M main
-   git remote add origin https://github.com/<you>/long-screen.git
-   git push -u origin main
-   ```
-3. **Allow the workflows to save results:** *Settings → Actions → General → Workflow permissions →* **Read and write permissions** → Save.
-4. **Turn on the website:** *Settings → Pages → Build and deployment →* Source **Deploy from a branch**, Branch **main**, folder **/docs** → Save.
-5. **Run it once now:** *Actions → Full screen (daily) → Run workflow.* The first run pulls four years of statements for about 1,200 companies, so it takes roughly 30–60 minutes. Later runs only re-pull statements older than a week, so they're faster.
-6. Open `https://<you>.github.io/long-screen/`. Until step 5 finishes, it shows the sample data with a banner.
+1. **Create a public repository** on github.com. It must be public for free GitHub Pages.
+2. **Upload these files.** GitHub's upload page won't take the hidden `.github` folder, so create the two workflow files with *Add file → Create new file*, naming them `.github/workflows/full-screen.yml` and `.github/workflows/prices.yml`, and paste in their contents.
+3. **Allow the workflows to write:** *Settings → Actions → General → Workflow permissions →* **Read and write permissions** → Save.
+4. **Run it once:** *Actions → Full screen (daily) → Run workflow.*
+5. **Point the website at the results:** when the run finishes, a branch called `gh-pages` will exist. Go to *Settings → Pages → Build and deployment →* Source **Deploy from a branch**, Branch **gh-pages**, folder **/ (root)** → Save.
+6. Open `https://<you>.github.io/<repo>/`.
 
-After that, everything is automatic:
+### How long runs take
+
+| Run | Time |
+|---|---|
+| First full run | 3–4.5 hours. Prices and TTM data load for every stock, plus statements for the 2,500 biggest companies. |
+| Next 2–3 daily runs | 2–4 hours each, filling in statements for the rest of the universe. |
+| Normal daily run after that | about 1–2 hours |
+| Hourly price refresh | about 2–5 minutes |
+
+Until a company's statements have been pulled, metrics that need them (3Y growth, ROIC, F-score and so on) show "no data", so the screen fills out over the first few days.
+
+**Why results go to a `gh-pages` branch:** with about 8,000 stocks updating hourly, saving each update on `main` would bloat the repository by gigabytes a year. The `gh-pages` branch is overwritten each time, so it stays small. Your code stays on `main`.
+
+### Schedule
 
 | Workflow | When (UTC) | What it does |
 |---|---|---|
-| Price refresh (hourly) | :35 past each hour, 13:35–20:35, Mon–Fri | Latest prices and all price-based ratios |
+| Price refresh (hourly) | :35 past every hour, Mon–Fri | Latest prices and all price-based ratios, covering Asian, European and US sessions |
 | Full screen (daily) | 21:45, Mon–Fri | Universe, TTM data, statements, scores, history |
 
-An open dashboard tab checks for new data every 10 minutes.
-
-### Running it on your own computer instead
+## Running it on your own computer
 
 ```bash
 pip install -r requirements.txt
-python screener.py full          # about 30-60 min the first time
-python screener.py prices        # quick price refresh
+python screener.py full              # several hours the first time
+python screener.py prices
 python -m http.server -d docs 8000   # then open http://localhost:8000
 ```
 
-Use `python screener.py full --limit 50` for a quick trial run. `python tools/make_demo.py` regenerates the sample data, and `python -m pytest tests` runs the offline tests.
+- `python screener.py full --limit 100` runs a quick trial on 100 tickers.
+- `python tools/make_demo.py` regenerates the sample data.
+- `python -m pytest tests` runs the offline tests.
 
-## Customising
+## Customising (top of `screener.py`)
 
-- **Default thresholds and which tests are on:** edit the `CRITERIA` list at the top of `screener.py`. The dashboard reads its defaults from there.
-- **Your own changes in the dashboard** are saved in your browser. *Reset to defaults* puts them back.
-- **Extra tickers** such as ADRs or anything outside the S&P 1500: add them to `EXTRA_TICKERS`.
-- **Sectors:** click the chips in the dashboard, or edit `EXCLUDE_SECTORS` to change the default.
-- **Schedule:** edit the `cron` lines in `.github/workflows/`.
+- **`CRITERIA`:** default thresholds and which tests are on.
+- **`INTERNATIONAL = False`:** go back to US only.
+- **`INTL_MIN_MCAP_USD`:** the size floor for international stocks. Lowering it adds many more stocks and makes runs much slower.
+- **`INTL_EXCHANGES`:** delete a country's line to leave it out.
+- **`EXTRA_TICKERS`:** add anything else, using Yahoo symbols such as `"7203.T"` or `"MC.PA"`.
+- **`STATEMENT_BUDGET`, `TIME_BUDGET_MIN`, `WORKERS`:** how hard each run works.
 
 ## Things to know
 
-- Yahoo's data is free and generally good, but it isn't audited. Check anything you plan to act on against the 10-K. Each stock's detail panel links to its filings.
-- If Yahoo rate-limits a run, the job retries with backoff. If fewer than half the tickers load, the workflow is marked failed and GitHub emails you, but the data that did load is still saved. Lower `WORKERS` in `screener.py` if this keeps happening.
-- GitHub may pause scheduled workflows in a repository that has had no activity for 60 days. If that happens, re-enable them from the Actions tab.
-- The new-entries, dropped and history views use the **default** criteria, so the record stays comparable from day to day.
+- Yahoo's data is free and generally good, but it isn't audited. International coverage is thinner than US coverage, especially for smaller markets. Check anything you plan to act on against the company's annual report.
+- Accounting standards differ between countries (US GAAP vs IFRS), so the same metric can be measured a little differently.
+- Hourly prices for markets that are closed simply repeat the last close.
+- If Yahoo rate-limits a run, it retries with backoff. If fewer than half the stocks load, the workflow is marked failed and GitHub emails you, but the data that did load is still published. Lower `WORKERS` if this keeps happening.
+- GitHub may pause scheduled workflows after 60 days with no activity in the repository. Re-enable them from the Actions tab if that happens.
 - This is a screen that produces candidates, not a buy list.

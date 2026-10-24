@@ -22,7 +22,7 @@
 </header>
 
 <div class="banner wrap" id="demo-banner" hidden>
-  <strong>Sample data.</strong> These are fictional companies so you can try the dashboard. Your first screener run replaces them with real S&amp;P 1500 numbers.
+  <strong>Sample data.</strong> These are fictional companies so you can try the dashboard. Your first screener run replaces them with real data for about 8,000 stocks worldwide.
 </div>
 
 <main class="wrap">
@@ -41,6 +41,10 @@
     </div>
     <div class="funnel" id="funnel" aria-label="How many names each criterion removes"></div>
     <div class="groups" id="groups" hidden></div>
+    <div class="sectors" id="markets-row">
+      <span class="label">Markets</span>
+      <div class="chips" id="markets"></div>
+    </div>
     <div class="sectors">
       <span class="label">Sectors</span>
       <div class="chips" id="sectors"></div>
@@ -81,7 +85,7 @@
         <button role="tab" type="button" data-view="all" aria-selected="false">All <span class="count"></span></button>
       </div>
       <div class="res-tools">
-        <label class="search"><span class="sr">Search</span><input id="q" type="search" placeholder="Ticker or name" autocomplete="off"></label>
+        <label class="search"><span class="sr">Search</span><input id="q" type="search" placeholder="Ticker, name or country" autocomplete="off"></label>
         <button class="btn" id="export" type="button">Export CSV</button>
       </div>
     </div>
@@ -91,7 +95,7 @@
   </section>
 
   <footer class="foot">
-    <p>Data from Yahoo Finance via yfinance. Fundamentals refresh after each US close; prices refresh hourly in market hours. A screen finds candidates. Read the filings before you buy.</p>
+    <p>Data from Yahoo Finance via yfinance. Prices are in each stock's local currency; market caps and cash-flow figures are converted to US dollars. Fundamentals refresh after each US close; prices refresh hourly on weekdays. A screen finds candidates. Read the filings before you buy.</p>
   </footer>
 </main>
 
