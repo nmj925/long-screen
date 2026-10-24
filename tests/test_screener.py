@@ -182,41 +182,68 @@ def test_missing_fx_means_no_mcap():
 
 
 def test_dedupe():
+    def r(name, country, region, mkt, rev=None, fin="EUR", cur="EUR", adv=0):
+        return {"name": name, "country": country, "region": region, "mkt": mkt, "_rev": rev, "_fin": fin, "cur": cur, "_adv": adv}
+
     recs = {
-        "SHEL.L": {"name": "Shell plc", "country": "United Kingdom", "region": "gb", "mkt": "UK & Ireland", "_adv": 5e8},
-        "SHELL.AS": {"name": "Shell PLC", "country": "United Kingdom", "region": "nl", "mkt": "Europe", "_adv": 2e8},
-        "AAPL": {"name": "Apple Inc.", "country": "United States", "region": "us", "mkt": "US"},
-        "AAPL.MX": {"name": "Apple Inc.", "country": "United States", "region": "mx", "mkt": "Latin America"},
-        "XYZ.MX": {"name": "Some US Co", "country": "United States", "region": "mx", "mkt": "Latin America"},
-        "0700.HK": {"name": "Tencent Holdings Ltd", "country": "China", "region": "hk", "mkt": "China & HK"},
-        "STLAM.MI": {"name": "Stellantis N.V.", "country": "Netherlands", "region": "it", "mkt": "Europe"},
-        "LIN": {"name": "Linde plc", "country": "Ireland", "region": "us", "mkt": "US"},
+        # same company, different names per exchange: matched by identical fundamentals, home listing wins
+        "SAP.DE": r("SAP SE", "Germany", "de", "Europe", 34.2e9, adv=5e8),
+        "SAP.VI": r("SAP SE INHABER-AKTIEN O.N.", "Germany", "at", "Europe", 34.2e9, adv=9e6),
+        # London: pence line beats the USD ADR line even with less dollar volume
+        "DGE.L": r("Diageo plc", "United Kingdom", "gb", "UK & Ireland", 20.2e9, "USD", "GBp", adv=1e8),
+        "DGED.L": r("DIAGEO PLC ADR (4:1)", "United Kingdom", "gb", "UK & Ireland", 20.2e9, "USD", "USD", adv=2e8),
+        # Dutch company listed in Paris and Frankfurt (no home listing): most traded wins
+        "AIR.PA": r("Airbus SE", "Netherlands", "fr", "Europe", 69e9, adv=4e8),
+        "AIR.DE": r("Airbus SE", "Netherlands", "de", "Europe", 69e9, adv=5e7),
+        # US companies: S&P listing wins; non-S&P US company on Mexico's exchange is dropped
+        "AAPL": r("Apple Inc.", "United States", "us", "US", 400e9, "USD", "USD"),
+        "AAPL.MX": r("Apple Inc.", "United States", "mx", "Latin America", 400e9, "USD", "MXN", adv=1e9),
+        "XYZ.MX": r("Some US Co", "United States", "mx", "Latin America", 3e9, "USD", "MXN"),
+        # share classes of one company collapse to the most traded
+        "005930.KS": r("Samsung Electronics", "South Korea", "kr", "Asia-Pacific", 300e12, "KRW", "KRW", adv=9e8),
+        "005935.KS": r("Samsung Electronics Pref", "South Korea", "kr", "Asia-Pacific", 300e12, "KRW", "KRW", adv=1e8),
+        # different companies with similar names stay separate
+        "DAL": r("Delta Air Lines", "United States", "us", "US", 61e9, "USD", "USD"),
+        "DELTA.BK": r("Delta Electronics (Thailand)", "Thailand", "th", "Asia-Pacific", 150e9, "THB", "THB"),
+        # no revenue from Yahoo: falls back to the name
+        "SHEL.L": r("Shell plc", "United Kingdom", "gb", "UK & Ireland", None, "USD", "GBp", adv=5e8),
+        "SHELL.AS": r("Shell PLC", "United Kingdom", "nl", "Europe", None, "USD", "EUR", adv=2e8),
     }
     out = S.dedupe(recs)
-    assert set(out) == {"SHEL.L", "AAPL", "0700.HK", "STLAM.MI", "LIN"}
+    assert set(out) == {"SAP.DE", "DGE.L", "AIR.PA", "AAPL", "005930.KS", "DAL", "DELTA.BK", "SHEL.L"}
 
 
-def test_intl_universe_pages_until_below_floor(monkeypatch):
+def test_intl_universe_reads_every_page_even_unsorted(monkeypatch):
+    """Yahoo doesn't reliably sort by size, so big companies can sit on any page."""
+    import random
     import yfinance as yf
 
-    calls = []
+    rnd_ = random.Random(1)
+    listings = [{"symbol": f"{i}.T", "marketCap": 1e13 / (i + 1), "currency": "JPY", "quoteType": "EQUITY"} for i in range(3000)]
+    rnd_.shuffle(listings)
+    xetra = [{"symbol": "SAP.DE", "marketCap": 2e11, "currency": "EUR", "financialCurrency": "EUR"},
+             {"symbol": "APC.DE", "marketCap": 3e12, "currency": "EUR", "financialCurrency": "USD"}]  # Apple on XETRA
 
     def fake_screen(q, offset=0, size=250, sortField=None, sortAsc=None):
         region = q.to_dict()["operands"][0]["operands"][1]
-        calls.append((region, offset))
-        if region != "jp":
-            return {"quotes": [], "total": 0}
-        caps = [1e13 / (i + 1) for i in range(offset, offset + 250)]  # yen, descending
-        return {"total": 4000, "quotes": [{"symbol": f"{i}.T", "marketCap": c, "currency": "JPY", "quoteType": "EQUITY"}
-                                          for i, c in zip(range(offset, offset + 250), caps)]}
+        data = {"jp": listings, "de": xetra}.get(region, [])
+        return {"total": len(data), "quotes": data[offset:offset + size]}
 
     monkeypatch.setattr(yf, "screen", fake_screen)
     monkeypatch.setattr(S, "INTL_EXCHANGES", {"jp": ["JPX"], "de": ["GER"]})
-    out = S.intl_universe({"USD": 1, "JPY": 0.0067})
-    floor = S.INTL_MIN_MCAP_USD * 0.5
-    expected = sum(1 for i in range(4000) if 1e13 / (i + 1) * 0.0067 >= floor)
-    assert len(out) == expected and all(v["region"] == "jp" for v in out.values())
-    assert len([c for c in calls if c[0] == "jp"]) < 16   # stopped paging early
+    monkeypatch.setattr(S.time, "sleep", lambda s: None)
+    out = S.intl_universe({"USD": 1, "JPY": 0.0067, "EUR": 1.1})
+    floor = S.INTL_MIN_MCAP_USD * 0.7
+    expected = {f"{i}.T" for i in range(3000) if 1e13 / (i + 1) * 0.0067 >= floor}
+    assert {t for t in out if t.endswith(".T")} == expected
+    assert "0.T" in out                                   # the biggest company is found wherever it sits
+    assert "SAP.DE" in out and "APC.DE" not in out        # cross-listing skipped on XETRA
+
+
+def test_pence_market_cap_without_share_count():
+    r = base_record(currency="GBp", financialCurrency="GBP", currentPrice=2500, marketCap=25e9, sharesOutstanding=None,
+                    impliedSharesOutstanding=None, trailingEps=1.25, trailingPE=20)
+    assert r["mcap"] == pytest.approx(25e9 * 1.30)
 
 
 def test_norm_name():

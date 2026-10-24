@@ -61,6 +61,23 @@ INTL_EXCHANGES = {
     "eg": ["CAI"],
 }
 
+# Home country of each listing region (used to prefer a company's home listing over cross-listings)
+REGION_COUNTRY = {
+    "us": "United States", "ca": "Canada", "gb": "United Kingdom", "ie": "Ireland", "de": "Germany", "fr": "France",
+    "nl": "Netherlands", "be": "Belgium", "ch": "Switzerland", "at": "Austria", "it": "Italy", "es": "Spain",
+    "pt": "Portugal", "se": "Sweden", "dk": "Denmark", "no": "Norway", "fi": "Finland", "is": "Iceland", "pl": "Poland",
+    "cz": "Czech Republic", "hu": "Hungary", "gr": "Greece", "ro": "Romania", "jp": "Japan", "cn": "China",
+    "hk": "Hong Kong", "in": "India", "kr": "South Korea", "tw": "Taiwan", "au": "Australia", "nz": "New Zealand",
+    "sg": "Singapore", "my": "Malaysia", "th": "Thailand", "id": "Indonesia", "ph": "Philippines", "vn": "Vietnam",
+    "br": "Brazil", "mx": "Mexico", "cl": "Chile", "co": "Colombia", "ar": "Argentina", "il": "Israel",
+    "tr": "Turkey", "za": "South Africa", "sa": "Saudi Arabia", "ae": "United Arab Emirates", "qa": "Qatar",
+    "kw": "Kuwait", "eg": "Egypt",
+}
+# Venues that also list thousands of foreign companies. There, a listing whose accounts are in another
+# currency is a cross-listing (the home listing is loaded from its own exchange), so it is skipped up front.
+CROSS_LISTING_VENUES = {"de": "EUR", "at": "EUR", "mx": "MXN"}
+MAX_SCREENER_PAGES = 80                # safety cap per country (80 x 250 listings)
+
 # Dashboard market groups
 _EUROPE = ["de", "fr", "nl", "be", "ch", "at", "it", "es", "pt", "se", "dk", "no", "fi", "is", "pl", "cz", "hu", "gr", "ro"]
 _APAC = ["kr", "tw", "au", "nz", "sg", "my", "th", "id", "ph", "vn"]
@@ -283,40 +300,44 @@ def fx_rates(currencies, known: dict | None = None) -> dict[str, float]:
 def intl_universe(fx: dict) -> dict[str, dict]:
     """Every listing on each country's main exchange worth roughly INTL_MIN_MCAP_USD or more.
 
-    Uses Yahoo's screener sorted by market cap, and stops paging once listings fall well below the floor.
-    The floor is applied loosely here (half of it, major-currency units) and exactly once per-stock data is in.
+    Pages through Yahoo's whole screener list for each country (it doesn't reliably sort by size, so we
+    can't stop early). The size floor is applied loosely here and exactly once per-stock data is in.
     """
     import yfinance as yf
 
     EQ = yf.EquityQuery
     out: dict[str, dict] = {}
-    floor = INTL_MIN_MCAP_USD * 0.5
+    floor = INTL_MIN_MCAP_USD * 0.7
     for region, exchanges in INTL_EXCHANGES.items():
         q = EQ("and", [EQ("eq", ["region", region]), EQ("is-in", ["exchange", *exchanges])])
-        offset, n = 0, 0
-        while True:
+        offset, n, seen, skipped = 0, 0, 0, 0
+        for _ in range(MAX_SCREENER_PAGES):
             try:
                 res = with_retries(lambda: yf.screen(q, offset=offset, size=250, sortField="intradaymarketcap", sortAsc=False))
             except Exception as e:
                 print(f"  ! {region}: screener failed at offset {offset}: {type(e).__name__}", file=sys.stderr)
                 break
             quotes = res.get("quotes") or []
-            last_usd = None
             for qt in quotes:
-                cur, mult = base_ccy(qt.get("currency"))
-                rate = fx.get(cur)
-                mc = num(qt.get("marketCap"))
-                if rate is None or mc is None:
+                seen += 1
+                cur, _ = base_ccy(qt.get("currency"))
+                rate, mc = fx.get(cur), num(qt.get("marketCap"))
+                if rate is None or mc is None or not qt.get("symbol") or qt.get("quoteType", "EQUITY") != "EQUITY":
                     continue
-                last_usd = mc * rate  # loose: treats minor units (pence) as major, so nothing is cut wrongly
-                if last_usd >= floor and qt.get("quoteType", "EQUITY") == "EQUITY" and qt.get("symbol"):
-                    out[qt["symbol"]] = {"region": region}
-                    n += 1
+                # loose: treats minor units (pence) as major, so nothing is cut wrongly
+                if mc * rate < floor:
+                    continue
+                home_ccy = CROSS_LISTING_VENUES.get(region)
+                if home_ccy and qt.get("financialCurrency") and qt["financialCurrency"] != home_ccy:
+                    skipped += 1
+                    continue
+                out[qt["symbol"]] = {"region": region}
+                n += 1
             offset += len(quotes)
-            if not quotes or offset >= (res.get("total") or 0) or (last_usd is not None and last_usd < floor):
+            if not quotes or offset >= (res.get("total") or 0):
                 break
             time.sleep(0.3)
-        print(f"    {region}: {n}")
+        print(f"    {region}: {n} of {seen} listings" + (f" ({skipped} cross-listings skipped)" if skipped else ""))
     return out
 
 
@@ -336,27 +357,40 @@ def _family(market: str | None) -> str | None:
     return "Europe" if market in ("Europe", "UK & Ireland") else market
 
 
+def _fingerprint(r: dict):
+    """Listings of the same company share Yahoo's fundamentals, so identical revenue in the same reporting
+    currency identifies them even when the names differ ("BASF SE" vs "BASF SE NA O.N.")."""
+    rev, ccy = r.get("_rev"), r.get("_fin")
+    if rev and rev > 0 and ccy:
+        return ("rev", ccy, sig(rev, 7))
+    return ("name", norm_name(r.get("name")) or r["t"])
+
+
 def dedupe(recs: dict[str, dict]) -> dict[str, dict]:
-    """One listing per company. Drops foreign listings of companies whose home market is covered elsewhere
-    (e.g. US stocks on Mexico's exchange), then keeps the best listing among same-name duplicates."""
+    """One listing per company.
+
+    1. Drop foreign listings of companies whose home market is covered elsewhere (US stocks on Mexico's or
+       Vienna's exchange), using the company's country of domicile.
+    2. Among listings of the same company (same fundamentals; same name if Yahoo has no revenue), keep the best: US/extra first,
+       then the home-country listing, then the one in the local currency, then the most traded.
+    """
     keep = {}
     for t, r in recs.items():
         home = COUNTRY_MARKET.get(r.get("country"))
         if r.get("region") not in ("us", "extra") and home and _family(home) != _family(r.get("mkt")):
             continue
         keep[t] = r
-    best: dict[str, str] = {}
+
+    def rank(x):
+        region = x.get("region")
+        local = {"gb": ("GBp", "GBP"), "za": ("ZAc", "ZAR"), "il": ("ILA", "ILS")}.get(region)
+        in_local = x.get("cur") in local if local else x.get("cur") != "USD" or region in ("us", "extra")
+        return (region in ("us", "extra"), REGION_COUNTRY.get(region) == x.get("country"), in_local, x.get("_adv") or 0)
+
+    best: dict = {}
     for t, r in keep.items():
-        key = norm_name(r.get("name")) or t
-        if key not in best:
-            best[key] = t
-            continue
-        o = keep[best[key]]
-
-        def rank(x):
-            return (x.get("region") in ("us", "extra"), COUNTRY_MARKET.get(x.get("country")) == x.get("mkt"), x.get("_adv") or 0)
-
-        if rank(r) > rank(o):
+        key = _fingerprint(r)
+        if key not in best or rank(r) > rank(keep[best[key]]):
             best[key] = t
     winners = set(best.values())
     return {t: r for t, r in keep.items() if t in winners}
@@ -609,6 +643,8 @@ def info_fields(info: dict, fx: dict) -> dict:
     shares = num(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
     from_shares = shares * price * r_cur if shares and price else None
     cands = [mc * r_cur if mc else None, mc * fx.get(base_ccy(cur)[0], r_cur) if mc else None]
+    if from_shares is None and cur in MINOR_CCY:
+        cands.reverse()  # Yahoo gives London market caps in pounds even though prices are in pence
     mcap = _closest(cands, from_shares)
     if from_shares and (mcap is None or abs(math.log(mcap / from_shares)) > math.log(3)):
         mcap = from_shares
@@ -631,6 +667,7 @@ def info_fields(info: dict, fx: dict) -> dict:
     fpe = num(info.get("forwardPE"))
     peg_y = num(info.get("trailingPegRatio") or info.get("pegRatio"))
     out["_adv"] = (num(info.get("averageVolume")) or 0) * (price or 0) * r_cur
+    out["_rev"], out["_fin"] = rev, fin  # fingerprint for spotting the same company on several exchanges
     out["_b"] = {
         "eps": eps,                                                         # listing currency
         "fcf": usd(fcf), "rev": usd(rev), "ebitda": usd(ebitda),            # USD
@@ -784,7 +821,8 @@ def score_all(stocks: list[dict]) -> None:
         s.pop("_ey", None)
 
 COVERAGE_KEYS = [c[0] for c in CRITERIA if c[5]]
-PRIVATE = ("_b", "_p", "_z", "_adv")          # kept in state.json for the hourly job, not sent to the browser
+PRIVATE = ("_b", "_p", "_z", "_adv")
+DROP = ("_rev", "_fin")                       # only needed during the run          # kept in state.json for the hourly job, not sent to the browser
 DETAIL = ("_spark", "_dates", "revh")         # detail.json, loaded by the dashboard on demand
 
 
@@ -815,7 +853,7 @@ def update_history(stocks: list[dict], crit: list[dict], when: str) -> dict:
 
 
 def write_outputs(head: dict, stocks: list[dict], detail: dict | None = None) -> None:
-    public = [{k: v for k, v in s.items() if k not in PRIVATE and k not in DETAIL} for s in stocks]
+    public = [{k: v for k, v in s.items() if k not in PRIVATE and k not in DETAIL and k not in DROP} for s in stocks]
     state = {s["t"]: {k: s[k] for k in PRIVATE if k in s} for s in stocks}
     markets = sorted({s.get("mkt") for s in stocks if s.get("mkt")})
     save_json(DATA / "screen.json", {**head, "criteria": criteria_spec(), "display": DISPLAY, "markets": markets,
