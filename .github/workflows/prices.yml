@@ -2,7 +2,7 @@ name: Price refresh (hourly)
 
 on:
   schedule:
-    - cron: "35 13-20 * * 1-5"   # hourly through the US session (UTC)
+    - cron: "35 * * * 1-5"   # every hour on weekdays: covers Asian, European and US sessions
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,10 @@ concurrency:
 jobs:
   prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      LS_DATA_DIR: site/data
+      LS_CACHE_DIR: site/cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,18 +26,29 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Refresh prices
+
+      - name: Load the last published data
+        id: load
         run: |
-          if grep -q '"demo":true' docs/data/screen.json 2>/dev/null; then
-            echo "Still on sample data. Run the Full screen workflow first."; exit 0
+          if ! git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            echo "No published data yet. Run the Full screen workflow first."; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          python screener.py prices
-      - name: Commit results
+          git clone --depth 1 --branch gh-pages "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" site
+          rm -rf site/.git
+
+      - name: Refresh prices
+        if: steps.load.outputs.skip != '1'
+        run: python screener.py prices
+
+      - name: Publish
+        if: steps.load.outputs.skip != '1'
         run: |
+          cp docs/index.html docs/style.css docs/app.js site/
+          touch site/.nojekyll
+          cd site
+          git init -q -b gh-pages
           git config user.name "screener-bot"
           git config user.email "screener-bot@users.noreply.github.com"
-          git add docs/data
-          git diff --cached --quiet && exit 0
-          git commit -m "Prices $(date -u +%Y-%m-%dT%H:%MZ)"
-          for i in 1 2 3 4; do git pull --rebase -X theirs && git push && exit 0; sleep $((i*5)); done
-          exit 1
+          git add -A
+          git commit -qm "Prices $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
