@@ -156,10 +156,11 @@ def main(out=ROOT / "docs" / "data"):
     S.us_universe = lambda: {t: {"region": "us", "idx": u["idx"]} for t, u in UNI.items() if u["region"] == "us"}
     S.intl_universe = lambda fx: {t: {"region": u["region"]} for t, u in UNI.items() if u["region"] != "us"}
     S.INTL_MIN_MCAP_USD = 5e8
+    S.REQUEST_PAUSE = 0
     S.fetch_info = fake_info
     S.fetch_statements = fake_statements
     S.download_prices = lambda tickers, period="14mo": pd.DataFrame({t: PRICES[t] for t in tickers})
-    for f in ("history.json",):
+    for f in ("history.json", "screen.json", "state.json", "detail.json"):
         (out / f).unlink(missing_ok=True)
     S.run_full()
 

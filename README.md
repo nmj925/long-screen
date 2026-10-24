@@ -58,16 +58,20 @@ Every stock gets a **composite score** from 0 to 100: quality 35%, growth 25%, v
 5. **Point the website at the results:** when the run finishes, a branch called `gh-pages` will exist. Go to *Settings → Pages → Build and deployment →* Source **Deploy from a branch**, Branch **gh-pages**, folder **/ (root)** → Save.
 6. Open `https://<you>.github.io/<repo>/`.
 
-### How long runs take
+### How long runs take, and how data fills in
+
+Yahoo blocks anyone who asks for too much too quickly, so the screener paces itself. Each run pulls:
+- up to 3,500 company snapshots (TTM figures), refreshed every 3 days
+- up to 1,500 sets of annual statements, refreshed weekly
+
+The biggest companies come first. When Yahoo starts refusing, the screener pauses and retries, and if Yahoo keeps refusing it stops and uses saved data. Anything Yahoo doesn't send is carried over from the previous run instead of going blank.
 
 | Run | Time |
 |---|---|
-| First full run | 3–4.5 hours. Prices and TTM data load for every stock, plus statements for the 2,500 biggest companies. |
-| Next 2–3 daily runs | 2–4 hours each, filling in statements for the rest of the universe. |
-| Normal daily run after that | about 1–2 hours |
+| Full screen (daily) | about 1–1.5 hours |
 | Hourly price refresh | about 2–5 minutes |
 
-Until a company's statements have been pulled, metrics that need them (3Y growth, ROIC, F-score and so on) show "no data", so the screen fills out over the first few days.
+The full international universe takes about **3 daily runs** to fill in, and statement-based metrics take about a week. Until then, smaller international names may show "no data" for metrics like 3Y growth or ROIC. You can speed this up by pressing *Run workflow* again once a run finishes.
 
 **Why results go to a `gh-pages` branch:** with about 8,000 stocks updating hourly, saving each update on `main` would bloat the repository by gigabytes a year. The `gh-pages` branch is overwritten each time, so it stays small. Your code stays on `main`.
 
@@ -98,7 +102,7 @@ python -m http.server -d docs 8000   # then open http://localhost:8000
 - **`INTL_MIN_MCAP_USD`:** the size floor for international stocks. Lowering it adds many more stocks and makes runs much slower.
 - **`INTL_EXCHANGES`:** delete a country's line to leave it out.
 - **`EXTRA_TICKERS`:** add anything else, using Yahoo symbols such as `"7203.T"` or `"MC.PA"`.
-- **`STATEMENT_BUDGET`, `TIME_BUDGET_MIN`, `WORKERS`:** how hard each run works.
+- **`INFO_BUDGET`, `STATEMENT_BUDGET`, `WORKERS`, `REQUEST_PAUSE`:** how hard each run pushes Yahoo. Raising them fills data faster but risks getting blocked.
 
 ## Things to know
 

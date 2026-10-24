@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import io
 import json
 import math
@@ -42,9 +43,12 @@ INTERNATIONAL = True                   # False = US only (S&P 1500)
 INTL_MIN_MCAP_USD = 2e9                # international stocks below this aren't loaded at all
 STATEMENT_MAX_AGE_DAYS = 7             # annual statements are re-pulled at most weekly
 STATEMENT_MIN_MCAP = 1e9               # skip statement pulls for tiny names (saves requests)
-STATEMENT_BUDGET = 2500                # max companies whose statements are pulled per run (biggest first)
-TIME_BUDGET_MIN = 270                  # stop starting new statement pulls after this, so the run always finishes
-WORKERS = 6                            # parallel Yahoo requests; lower it if you get rate limited
+STATEMENT_BUDGET = 1500                # max companies whose statements are pulled per run (missing first, then stalest)
+INFO_MAX_AGE_DAYS = 3                  # TTM snapshot re-pulled every 3 days (prices and price ratios update every run)
+INFO_BUDGET = 3500                     # max TTM snapshots pulled per run
+TIME_BUDGET_MIN = 270                  # stop starting new pulls after this, so the run always finishes
+WORKERS = 3                            # parallel Yahoo requests; lower it if you get rate limited
+REQUEST_PAUSE = 0.3                    # seconds each worker waits between requests (keeps Yahoo from blocking us)
 HISTORY_DAYS = 400
 
 # Main exchange(s) per country, as Yahoo names them. Delete a line to drop that country.
@@ -200,8 +204,10 @@ def sig(x, digits=6):
 
 def load_json(path: Path, default):
     try:
+        if path.suffix == ".gz":
+            return json.loads(gzip.decompress(path.read_bytes()))
         return json.loads(path.read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, EOFError):
         return default
 
 
@@ -214,8 +220,11 @@ def save_json(path: Path, obj, records=False):
         text = json.dumps(head, separators=(",", ":"))[:-1] + ',"stocks":[\n' + ",\n".join(lines) + "\n]}\n"
     else:
         text = json.dumps(obj, separators=(",", ":"))
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(text)
+    tmp = path.with_name(path.name + ".tmp")
+    if path.suffix == ".gz":
+        tmp.write_bytes(gzip.compress(text.encode(), compresslevel=6))
+    else:
+        tmp.write_text(text)
     tmp.replace(path)
 
 
@@ -228,6 +237,67 @@ def with_retries(fn, tries=4, base=3.0):
                 raise
             limited = "RateLimit" in type(e).__name__ or "429" in str(e) or "Too Many" in str(e)
             time.sleep(base * (2 ** i) * (4 if limited else 1))
+
+
+class YahooRateLimitOrEmpty(Exception):
+    """Yahoo answered with nothing useful. When it is rate limiting, it often does this instead of erroring."""
+
+
+def fetch_many(fn, tickers: list[str], label: str, deadline: float, budget: int | None = None):
+    """Fetch in small paced batches. If most of a batch fails, Yahoo is blocking us: back off and retry
+    that batch, and give up for this run after repeated blocks (cached data is used for the rest).
+    Stragglers that failed inside otherwise-good batches get one more try at the end."""
+    results: dict[str, object] = {}
+    todo = list(tickers[:budget] if budget else tickers)
+    t0 = time.time()
+    aborted = False
+
+    def call(t):
+        out = fn(t)
+        time.sleep(REQUEST_PAUSE)
+        return out
+
+    def run(items: list[str], ex) -> list[str]:
+        nonlocal aborted
+        failed: list[str] = []
+        strikes, i = 0, 0
+        while i < len(items):
+            if time.time() > deadline:
+                print(f"    {label}: time budget reached at {i}/{len(items)}; the rest come from cache / next run")
+                return failed + items[i:]
+            batch = items[i:i + 30]
+            futs = {ex.submit(call, t): t for t in batch}
+            bad = []
+            for f in as_completed(futs):
+                try:
+                    results[futs[f]] = f.result()
+                except Exception:
+                    bad.append(futs[f])
+            if len(bad) > 0.6 * len(batch):
+                strikes += 1
+                if strikes > 4:
+                    print(f"    {label}: Yahoo keeps blocking; stopping at {i}/{len(items)}, cached data used for the rest")
+                    aborted = True
+                    return failed + bad + items[i + len(batch):]
+                wait = 120 * strikes
+                print(f"    {label}: {len(bad)}/{len(batch)} failed, Yahoo is likely rate limiting; pausing {wait}s")
+                time.sleep(wait)
+                continue  # retry the same batch (its successes are already kept)
+            strikes = max(0, strikes - 1)
+            failed += bad
+            i += len(batch)
+            if i % 600 < 30:
+                print(f"    {label}: {i}/{len(items)}  ({time.time() - t0:.0f}s, {len(failed)} failed so far)")
+        return failed
+
+    with ThreadPoolExecutor(WORKERS) as ex:
+        failed = run(todo, ex)
+        if failed and not aborted and time.time() < deadline:
+            time.sleep(30)
+            failed = run(failed, ex)
+    failed = [t for t in failed if t not in results]
+    return results, failed
+
 
 # ---------------------------------------------------------------------------
 # universe
@@ -331,14 +401,23 @@ def intl_universe(fx: dict) -> dict[str, dict]:
                 if home_ccy and qt.get("financialCurrency") and qt["financialCurrency"] != home_ccy:
                     skipped += 1
                     continue
-                out[qt["symbol"]] = {"region": region}
+                out[qt["symbol"]] = {"region": region, "qmc": mc * rate}
                 n += 1
             offset += len(quotes)
             if not quotes or offset >= (res.get("total") or 0):
                 break
             time.sleep(0.3)
         print(f"    {region}: {n} of {seen} listings" + (f" ({skipped} cross-listings skipped)" if skipped else ""))
-    return out
+    # Keep listings seen in the last 14 days, so one bad screener answer doesn't drop a whole country
+    cache_file = CACHE / "universe_intl.json"
+    cached = load_json(cache_file, {})
+    today = dt.date.today().isoformat()
+    for t, v in out.items():
+        cached[t] = {**v, "seen": today}
+    cutoff = (dt.date.today() - dt.timedelta(days=14)).isoformat()
+    cached = {t: v for t, v in cached.items() if v.get("seen", today) >= cutoff and v.get("region") in INTL_EXCHANGES}
+    save_json(cache_file, cached)
+    return {t: {k: v[k] for k in ("region", "qmc") if k in v} for t, v in cached.items()}
 
 
 _SUFFIXES = {"inc", "incorporated", "corp", "corporation", "co", "company", "ltd", "limited", "plc", "ag", "sa", "se",
@@ -571,19 +650,38 @@ def fetch_statements(ticker: str) -> dict:
     import yfinance as yf
 
     t = yf.Ticker(ticker)
-    inc = with_retries(lambda: t.income_stmt)
-    bal = with_retries(lambda: t.balance_sheet)
-    cf = with_retries(lambda: t.cashflow)
+    inc = with_retries(lambda: t.income_stmt, tries=2)
+    if inc is None or inc.empty:
+        raise YahooRateLimitOrEmpty(ticker)  # don't cache an empty answer as if it were real
+    bal = with_retries(lambda: t.balance_sheet, tries=2)
+    cf = with_retries(lambda: t.cashflow, tries=2)
     return statement_metrics(inc, bal, cf)
+
 
 # ---------------------------------------------------------------------------
 # info (TTM snapshot), currency handling and prices
 # ---------------------------------------------------------------------------
 
+INFO_KEYS = ("quoteType", "shortName", "longName", "sector", "industry", "country", "currency", "financialCurrency",
+             "currentPrice", "regularMarketPrice", "marketCap", "sharesOutstanding", "impliedSharesOutstanding",
+             "trailingEps", "trailingPE", "trailingPegRatio", "pegRatio", "forwardPE", "priceToSalesTrailing12Months",
+             "returnOnEquity", "grossMargins", "operatingMargins", "currentRatio", "revenueGrowth", "beta",
+             "recommendationMean", "numberOfAnalystOpinions", "heldPercentInsiders", "heldPercentInstitutions",
+             "shortPercentOfFloat", "trailingAnnualDividendYield", "debtToEquity", "freeCashflow", "totalRevenue",
+             "totalDebt", "totalCash", "ebitda", "averageVolume", "targetMeanPrice", "fullExchangeName", "exchange")
+
+
 def fetch_info(ticker: str) -> dict:
     import yfinance as yf
 
-    return with_retries(lambda: yf.Ticker(ticker).info) or {}
+    def get():
+        info = yf.Ticker(ticker).info or {}
+        if not (info.get("shortName") or info.get("longName")) or not (
+                info.get("marketCap") or info.get("regularMarketPrice") or info.get("currentPrice")):
+            raise YahooRateLimitOrEmpty(ticker)
+        return {k: info[k] for k in INFO_KEYS if info.get(k) is not None}
+
+    return with_retries(get, tries=2)
 
 
 def _closest(cands: list, target):
@@ -713,19 +811,36 @@ def price_metrics(close: pd.Series) -> dict:
     return m
 
 
-def download_prices(tickers: list[str], period="14mo") -> pd.DataFrame:
+def _download(tickers: list[str], period: str, chunk: int) -> pd.DataFrame:
     import yfinance as yf
 
     frames = []
-    for i in range(0, len(tickers), 200):
-        chunk = tickers[i:i + 200]
-        df = with_retries(lambda: yf.download(chunk, period=period, interval="1d", auto_adjust=True,
-                                              progress=False, threads=True, group_by="column"))
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        try:
+            df = with_retries(lambda: yf.download(part, period=period, interval="1d", auto_adjust=True,
+                                                  progress=False, threads=True, group_by="column"))
+        except Exception as e:
+            print(f"    ! price chunk failed: {type(e).__name__}", file=sys.stderr)
+            continue
         if df is None or df.empty:
             continue
-        close = df["Close"] if isinstance(df.columns, pd.MultiIndex) else df[["Close"]].rename(columns={"Close": chunk[0]})
-        frames.append(close)
+        close = df["Close"] if isinstance(df.columns, pd.MultiIndex) else df[["Close"]].rename(columns={"Close": part[0]})
+        frames.append(close.dropna(axis=1, how="all"))
+        time.sleep(1)
     return pd.concat(frames, axis=1) if frames else pd.DataFrame()
+
+
+def download_prices(tickers: list[str], period="14mo") -> pd.DataFrame:
+    """Batched daily closes. Tickers that come back empty (often Yahoo throttling) get one slower retry."""
+    closes = _download(tickers, period, 100)
+    missing = [t for t in tickers if t not in closes.columns]
+    if missing and len(missing) < len(tickers):
+        print(f"    {len(missing)} price series missing; retrying slowly")
+        time.sleep(60)
+        more = _download(missing, period, 40)
+        closes = pd.concat([closes, more], axis=1) if not more.empty else closes
+    return closes.loc[:, ~closes.columns.duplicated()] if not closes.empty else closes
 
 # ---------------------------------------------------------------------------
 # derived ratios, scoring, screening
@@ -867,8 +982,25 @@ def write_outputs(head: dict, stocks: list[dict], detail: dict | None = None) ->
 # runs
 # ---------------------------------------------------------------------------
 
+PRICE_KEYS = ("price", "chg1d", "perf3m", "perf6m", "perf12m", "mom", "dma200", "off_high", "vol", "mdd")
+
+
+def previous_records() -> tuple[dict, dict]:
+    """Last published stocks (merged with their hourly state) and detail, used when Yahoo fails today."""
+    screen = load_json(DATA / "screen.json", {})
+    if screen.get("demo"):
+        return {}, {}
+    state = load_json(DATA / "state.json", {})
+    prev = {s["t"]: {**s, **state.get(s["t"], {})} for s in screen.get("stocks", [])}
+    return prev, load_json(DATA / "detail.json", {})
+
+
 def run_full(limit: int | None = None) -> None:
     t0 = time.time()
+    deadline = t0 + TIME_BUDGET_MIN * 60
+    today = dt.date.today()
+    prev, prev_detail = previous_records()
+
     print("1/6 currencies and universe")
     fx = fx_rates(BASE_CCYS if INTERNATIONAL else [])
     uni = us_universe()
@@ -884,46 +1016,65 @@ def run_full(limit: int | None = None) -> None:
     closes = download_prices(tickers)
     print(f"    {closes.shape[1]} price series")
 
-    print("3/6 TTM snapshot (Yahoo info)")
-    infos: dict[str, dict] = {}
-    failed = []
-    with ThreadPoolExecutor(WORKERS) as ex:
-        futs = {ex.submit(fetch_info, t): t for t in tickers}
-        for i, f in enumerate(as_completed(futs), 1):
-            t = futs[f]
-            try:
-                info = f.result()
-                if info.get("quoteType") in (None, "EQUITY"):
-                    infos[t] = info
-            except Exception as e:
-                failed.append(t)
-                print(f"    ! {t}: {type(e).__name__}", file=sys.stderr)
-            if i % 500 == 0:
-                print(f"    {i}/{len(tickers)}  ({time.time() - t0:.0f}s)")
-    fx = fx_rates({c for i in infos.values() for c in (i.get("currency"), i.get("financialCurrency"))} - {None}, fx)
+    print("3/6 TTM snapshots (Yahoo info, refreshed every few days)")
+    info_cache = load_json(CACHE / "info.json.gz", {})
+
+    def info_age(t):
+        return (today - dt.date.fromisoformat(info_cache[t]["_at"])).days if t in info_cache else 10 ** 6
+
+    def size(t):
+        return (uni[t].get("qmc") or 0) if uni[t]["region"] not in ("us", "extra") else 1e15
+
+    due = [t for t in tickers if info_age(t) >= INFO_MAX_AGE_DAYS]
+    due.sort(key=lambda t: (t in info_cache, -info_age(t), -size(t)))  # never-fetched first, US first, biggest first
+    print(f"    {len(due)} due, up to {INFO_BUDGET} this run, {len(info_cache)} cached")
+    info_got, failed = fetch_many(fetch_info, due, "info", deadline, INFO_BUDGET)
+    for t, info in info_got.items():
+        info_cache[t] = {**info, "_at": today.isoformat()}
+    save_json(CACHE / "info.json.gz", info_cache)
+    fx = fx_rates({c for i in info_cache.values() for c in (i.get("currency"), i.get("financialCurrency"))} - {None}, fx)
 
     recs: dict[str, dict] = {}
-    for t, info in infos.items():
+    carried = 0
+    for t in tickers:
         u = uni[t]
-        r = {"t": t, "idx": u.get("idx") or (info.get("fullExchangeName") or info.get("exchange")),
-             "region": u["region"], **info_fields(info, fx)}
-        r["mkt"] = MARKET_OF_REGION.get(u["region"]) or COUNTRY_MARKET.get(r.get("country")) or "Other"
-        if u["region"] not in ("us", "extra") and (r.get("mcap") or 0) < INTL_MIN_MCAP_USD:
+        info = info_cache.get(t)
+        if info is None:
+            if t in prev:  # not fetched yet / failed: keep the last published record, prices refresh below
+                recs[t] = {k: v for k, v in prev[t].items() if k not in ("sub", "score", "coverage")}
+                carried += 1
             continue
+        if info.get("quoteType") not in (None, "EQUITY"):
+            continue
+        r = {"t": t, "idx": u.get("idx") or (info.get("fullExchangeName") or info.get("exchange")),
+             "region": u["region"], **info_fields(info, fx), "info_at": info["_at"]}
+        r["mkt"] = MARKET_OF_REGION.get(u["region"]) or COUNTRY_MARKET.get(r.get("country")) or "Other"
         recs[t] = r
+    recs = {t: r for t, r in recs.items()
+            if r.get("region") in ("us", "extra") or (r.get("mcap") or 0) >= INTL_MIN_MCAP_USD}
     before = len(recs)
     recs = dedupe(recs)
-    print(f"    {len(recs)} stocks after removing {before - len(recs)} duplicate/foreign listings")
+    print(f"    {len(recs)} stocks ({carried} carried from the last run), {before - len(recs)} duplicate/foreign listings removed")
 
+    stale_px = 0
     for t, r in recs.items():
-        if t in closes.columns:
+        if t in closes.columns and closes[t].dropna().size >= 30:
             r.update(price_metrics(closes[t]))
+        elif t in prev:  # Yahoo didn't send prices today: keep yesterday's
+            r.update({k: prev[t].get(k) for k in PRICE_KEYS if k in prev[t]})
+            if prev[t].get("_p"):
+                r["_p"] = prev[t]["_p"]
+            pd_ = prev_detail.get(t) or {}
+            r["_spark"], r["_dates"] = pd_.get("spark"), pd_.get("dates")
+            stale_px += 1
         if r.get("_b") is not None:
             r["_b"]["mcap_px"] = r["_b"].get("mcap_px") or r.get("price")
+    if stale_px:
+        print(f"    {stale_px} stocks kept yesterday's prices")
 
-    print("4/6 annual statements (cached weekly, biggest companies first)")
+    print("4/6 annual statements (cached weekly)")
     cache = load_json(CACHE / "fundamentals.json", {})
-    today = dt.date.today()
+    cache = {t: v for t, v in cache.items() if v.get("fy_end")}  # drop empty answers saved by older versions
 
     def age(t):
         return (today - dt.date.fromisoformat(cache[t]["_at"])).days if t in cache else 10 ** 6
@@ -932,27 +1083,12 @@ def run_full(limit: int | None = None) -> None:
                 if r.get("sector") not in EXCLUDE_SECTORS and (r.get("mcap") or 0) >= STATEMENT_MIN_MCAP
                 and age(t) >= STATEMENT_MAX_AGE_DAYS]
     eligible.sort(key=lambda t: (t in cache, -age(t), -(recs[t].get("mcap") or 0)))  # missing first, then stalest
-    need = eligible[:STATEMENT_BUDGET]
-    print(f"    {len(eligible)} due, pulling {len(need)} this run, {len(cache)} cached")
-    deadline = t0 + TIME_BUDGET_MIN * 60
-    done = 0
-    with ThreadPoolExecutor(WORKERS) as ex:
-        for start in range(0, len(need), 100):
-            if time.time() > deadline:
-                print(f"    time budget reached; the rest will be pulled on the next run")
-                break
-            batch = need[start:start + 100]
-            futs = {ex.submit(fetch_statements, t): t for t in batch}
-            for f in as_completed(futs):
-                t = futs[f]
-                try:
-                    cache[t] = {**f.result(), "_at": today.isoformat()}
-                    done += 1
-                except Exception as e:
-                    print(f"    ! statements {t}: {type(e).__name__}", file=sys.stderr)
-            if start % 500 == 0:
-                print(f"    {start + len(batch)}/{len(need)}  ({time.time() - t0:.0f}s)")
-                save_json(CACHE / "fundamentals.json", cache)
+    print(f"    {len(eligible)} due, up to {STATEMENT_BUDGET} this run, {len(cache)} cached")
+    got, _ = fetch_many(fetch_statements, eligible, "statements", deadline, STATEMENT_BUDGET)
+    for t, m in got.items():
+        if m.get("fy_end"):
+            cache[t] = {**m, "_at": today.isoformat()}
+    done = len(got)
     save_json(CACHE / "fundamentals.json", cache)
     for t, r in recs.items():
         if t in cache:
@@ -964,6 +1100,8 @@ def run_full(limit: int | None = None) -> None:
                 if st.get("_z"):
                     st["_z"] = {**st["_z"], "tl_usd": (st["_z"].get("tl") or 0) * r_fin}
             r.update(st)
+        elif t in prev_detail and prev_detail[t].get("revh") and "revh" not in r:
+            r["revh"] = prev_detail[t]["revh"]
 
     print("5/6 scoring")
     stocks = sorted(recs.values(), key=lambda r: r["t"])
@@ -974,18 +1112,22 @@ def run_full(limit: int | None = None) -> None:
     print("6/6 writing")
     detail = {s["t"]: {"spark": s.get("_spark"), "dates": s.get("_dates"), "revh": s.get("revh")} for s in stocks}
     history = update_history(stocks, crit, when)
-    n_intl = sum(s["region"] != "us" for s in stocks)
+    n_intl = sum(s["region"] not in ("us", "extra") for s in stocks)
+    n_us = len(stocks) - n_intl
     write_outputs({
         "generated": when, "prices_updated": when, "demo": False,
-        "universe": "S&P 1500" + (f" + {n_intl:,} international" if n_intl else ""),
-        "stats": {"listings": len(tickers), "loaded": len(stocks), "failed": len(failed),
+        "universe": f"{n_us:,} US" + (f" + {n_intl:,} international" if n_intl else ""),
+        "stats": {"listings": len(tickers), "loaded": len(stocks), "info_pulled": len(info_got),
+                  "info_failed": len(failed), "carried_from_last_run": carried, "stale_prices": stale_px,
                   "statements_cached": len(cache), "statements_pulled": done},
     }, stocks, detail)
     save_json(DATA / "history.json", history)
     n = sum(passes(s, crit) for s in stocks)
-    print(f"done in {time.time() - t0:.0f}s: {len(stocks)} stocks, {n} pass the default screen, {len(failed)} failed")
-    if len(infos) < 0.5 * len(tickers):
-        raise SystemExit("Fewer than half the tickers loaded; Yahoo may be rate limiting. Data was still written.")
+    print(f"done in {time.time() - t0:.0f}s: {len(stocks)} stocks, {n} pass the default screen, "
+          f"{len(failed)} snapshots failed, {stale_px} on yesterday's prices")
+    pending = sum(1 for t in tickers if t not in info_cache)
+    if pending:
+        print(f"note: {pending} listings still waiting for their first snapshot; they fill in over the next runs")
 
 
 def run_prices() -> None:

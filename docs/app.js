@@ -537,7 +537,7 @@
       : `<a href="https://www.google.com/search?q=${encodeURIComponent((s.name || t) + " annual report investor relations")}" target="_blank" rel="noopener">Annual report search</a>`}</div>`;
     $("#d-body").innerHTML = `
       <div class="d-head"><span class="tkr">${esc(t)} · ${esc(s.idx || "")}${s.country ? " · " + esc(s.country) : ""}</span><h2 id="d-title">${esc(s.name)}</h2>
-        <span class="hint">${esc(s.sector)}${s.industry && s.industry !== s.sector ? " · " + esc(s.industry) : ""}${s.fy_end ? " · last annual report " + esc(s.fy_end) : ""}</span></div>
+        <span class="hint">${esc(s.sector)}${s.industry && s.industry !== s.sector ? " · " + esc(s.industry) : ""}${s.fy_end ? " · last annual report " + esc(s.fy_end) : ""}${s.info_at ? " · fundamentals checked " + esc(s.info_at) : ""}</span></div>
       <div class="d-price"><span class="p">${money(s.price, s.cur)}</span><span class="${(s.chg1d ?? 0) >= 0 ? "pos" : "neg"}">${fmt("pct", s.chg1d)} today</span>
         <span class="hint">${fmt("usd", s.mcap)} market cap (USD)</span>${verdict}
         <button type="button" class="star" data-star="${esc(t)}" aria-pressed="${S.watch.has(t)}" aria-label="Watch ${esc(t)}" style="font-size:18px">★</button></div>

@@ -1,4 +1,5 @@
 """Offline tests: synthetic Yahoo-shaped statements and prices, no network."""
+import json
 import math
 import sys
 from pathlib import Path
@@ -249,3 +250,77 @@ def test_pence_market_cap_without_share_count():
 def test_norm_name():
     assert S.norm_name("Shell plc") == S.norm_name("SHELL PLC") == "shell"
     assert S.norm_name("Toyota Motor Corporation") == "toyota motor"
+
+
+def test_fetch_info_rejects_empty_answers(monkeypatch):
+    import yfinance as yf
+
+    class T:
+        def __init__(self, t):
+            self.info = {"trailingPegRatio": None} if t == "BLOCKED" else {"shortName": "Ok Co", "marketCap": 5e9, "sector": "Technology"}
+
+    monkeypatch.setattr(yf, "Ticker", T)
+    monkeypatch.setattr(S.time, "sleep", lambda s: None)
+    assert S.fetch_info("OK")["shortName"] == "Ok Co"
+    with pytest.raises(S.YahooRateLimitOrEmpty):
+        S.fetch_info("BLOCKED")
+
+
+def test_fetch_many_backs_off_and_retries_when_blocked(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(S, "REQUEST_PAUSE", 0)
+    state = {"blocked_calls": 40}
+
+    def fn(t):
+        if state["blocked_calls"] > 0:  # Yahoo blocks the first 40 calls, then recovers
+            state["blocked_calls"] -= 1
+            raise S.YahooRateLimitOrEmpty(t)
+        return t.lower()
+
+    tickers = [f"T{i}" for i in range(100)]
+    got, failed = fn_res = S.fetch_many(fn, tickers, "test", deadline=S.time.time() + 3600)
+    assert len(got) == 100 and not failed          # blocked batches were retried, nothing lost
+    assert any(s >= 120 for s in sleeps)           # it paused when blocked
+
+
+def test_fetch_many_gives_up_after_repeated_blocks(monkeypatch):
+    monkeypatch.setattr(S.time, "sleep", lambda s: None)
+    monkeypatch.setattr(S, "REQUEST_PAUSE", 0)
+
+    def fn(t):
+        raise S.YahooRateLimitOrEmpty(t)
+
+    got, failed = S.fetch_many(fn, [f"T{i}" for i in range(90)], "test", deadline=S.time.time() + 3600)
+    assert not got and len(failed) == 90
+
+
+def test_full_run_survives_yahoo_blocking(tmp_path, monkeypatch):
+    """Second run: Yahoo blocks snapshots and prices for half the stocks. Nothing should go blank."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import importlib
+    demo = importlib.import_module("make_demo")
+    demo.main(tmp_path)                                  # first run (sample data), then mark it as real
+    screen = json.loads((tmp_path / "screen.json").read_text())
+    screen["demo"] = False
+    S.save_json(tmp_path / "screen.json", screen, records=True)
+    first = {s["t"]: s for s in screen["stocks"]}
+
+    S.DATA, S.CACHE = tmp_path, tmp_path / "cache"
+    blocked = set(sorted(first)[len(first) // 2:])
+    real_info, real_prices = S.fetch_info, S.download_prices
+
+    def info(t):
+        if t in blocked:
+            raise S.YahooRateLimitOrEmpty(t)
+        return real_info(t)
+
+    monkeypatch.setattr(S, "fetch_info", info)
+    monkeypatch.setattr(S, "download_prices", lambda tk, period="14mo": real_prices([t for t in tk if t not in blocked], period))
+    monkeypatch.setattr(S.time, "sleep", lambda s: None)
+    S.run_full()
+    second = {s["t"]: s for s in json.loads((tmp_path / "screen.json").read_text())["stocks"]}
+    for t in blocked & set(first):
+        assert second[t]["name"] == first[t]["name"]
+        assert second[t]["price"] == first[t]["price"]
+        assert second[t].get("mcap") is not None or first[t].get("mcap") is None
