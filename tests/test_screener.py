@@ -11,6 +11,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import screener as S  # noqa: E402
 
+@pytest.fixture(autouse=True)
+def _isolated_dirs(tmp_path, monkeypatch):
+    """Tests must never touch real data, even when LS_DATA_DIR / LS_CACHE_DIR are set (as in the workflow)."""
+    monkeypatch.setattr(S, "DATA", tmp_path / "data")
+    monkeypatch.setattr(S, "CACHE", tmp_path / "cache")
+
+
 FX = {"USD": 1.0, "JPY": 0.0067, "GBP": 1.30, "GBp": 0.013, "TWD": 0.031, "EUR": 1.08}
 DATES = pd.to_datetime(["2025-12-31", "2024-12-31", "2023-12-31", "2022-12-31"])
 
@@ -300,6 +307,9 @@ def test_full_run_survives_yahoo_blocking(tmp_path, monkeypatch):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
     import importlib
     demo = importlib.import_module("make_demo")
+    for name in ("fx_rates", "us_universe", "intl_universe", "fetch_info", "fetch_statements", "download_prices",
+                 "INTL_MIN_MCAP_USD", "REQUEST_PAUSE"):
+        monkeypatch.setattr(S, name, getattr(S, name))  # make_demo patches these; restore them after the test
     demo.main(tmp_path)                                  # first run (sample data), then mark it as real
     screen = json.loads((tmp_path / "screen.json").read_text())
     screen["demo"] = False

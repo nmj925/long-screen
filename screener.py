@@ -1009,6 +1009,9 @@ def run_full(limit: int | None = None) -> None:
     if INTERNATIONAL:
         for t, v in intl_universe(fx).items():
             uni.setdefault(t, v)
+    for t, r in prev.items():  # keep last run's stocks if a country list failed to load today
+        if r.get("region") and (INTERNATIONAL or r["region"] in ("us", "extra")):
+            uni.setdefault(t, {k: r[k] for k in ("region", "idx") if r.get(k)})
     tickers = sorted(uni)[:limit] if limit else sorted(uni)
     print(f"    {len(tickers)} listings")
 
