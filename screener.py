@@ -668,7 +668,8 @@ INFO_KEYS = ("quoteType", "shortName", "longName", "sector", "industry", "countr
              "returnOnEquity", "grossMargins", "operatingMargins", "currentRatio", "revenueGrowth", "beta",
              "recommendationMean", "numberOfAnalystOpinions", "heldPercentInsiders", "heldPercentInstitutions",
              "shortPercentOfFloat", "trailingAnnualDividendYield", "debtToEquity", "freeCashflow", "totalRevenue",
-             "totalDebt", "totalCash", "ebitda", "averageVolume", "targetMeanPrice", "fullExchangeName", "exchange")
+             "totalDebt", "totalCash", "ebitda", "averageVolume", "targetMeanPrice", "fullExchangeName", "exchange",
+             "netIncomeToCommon")
 
 
 def fetch_info(ticker: str) -> dict:
@@ -756,6 +757,9 @@ def info_fields(info: dict, fx: dict) -> dict:
     usd = (lambda v: v * r_money if v is not None else None)
     # EPS -> listing currency. P/E cross-check catches ADRs where Yahoo quotes per-ADR EPS in dollars
     eps, pe_y = num(info.get("trailingEps")), num(info.get("trailingPE"))
+    ni = num(info.get("netIncomeToCommon"))
+    if eps is None and ni is not None and shares:  # e.g. Korea: Yahoo gives no trailing EPS
+        eps = ni / shares  # reporting currency, converted below
     if eps is not None:
         eps_conv = eps * r_fin / r_cur
         if pe_y and price and eps > 0:

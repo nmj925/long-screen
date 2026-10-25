@@ -18,7 +18,7 @@ def _isolated_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "CACHE", tmp_path / "cache")
 
 
-FX = {"USD": 1.0, "JPY": 0.0067, "GBP": 1.30, "GBp": 0.013, "TWD": 0.031, "EUR": 1.08}
+FX = {"USD": 1.0, "JPY": 0.0067, "GBP": 1.30, "GBp": 0.013, "TWD": 0.031, "EUR": 1.08, "KRW": 0.00075}
 DATES = pd.to_datetime(["2025-12-31", "2024-12-31", "2023-12-31", "2022-12-31"])
 
 
@@ -334,3 +334,15 @@ def test_full_run_survives_yahoo_blocking(tmp_path, monkeypatch):
         assert second[t]["name"] == first[t]["name"]
         assert second[t]["price"] == first[t]["price"]
         assert second[t].get("mcap") is not None or first[t].get("mcap") is None
+
+
+def test_eps_from_net_income_when_yahoo_has_none():
+    # Korea: no trailingEps / trailingPE from Yahoo
+    r = base_record(currency="KRW", financialCurrency="KRW", currentPrice=200000, marketCap=1.2e15, sharesOutstanding=6e9,
+                    trailingEps=None, trailingPE=None, netIncomeToCommon=6e13, trailingPegRatio=None)
+    S.derive(r)
+    assert r["pe"] == pytest.approx(200000 / (6e13 / 6e9))   # = 20
+
+
+def test_fetch_info_keeps_net_income():
+    assert "netIncomeToCommon" in S.INFO_KEYS
