@@ -216,9 +216,12 @@ def test_dedupe():
         # no revenue from Yahoo: falls back to the name
         "SHEL.L": r("Shell plc", "United Kingdom", "gb", "UK & Ireland", None, "USD", "GBp", adv=5e8),
         "SHELL.AS": r("Shell PLC", "United Kingdom", "nl", "Europe", None, "USD", "EUR", adv=2e8),
+        # secondary listing without revenue, same name as a listing with fundamentals: dropped
+        "ERIC-B.ST": r("ERICSSON, TELEFONAB. L M SER. B", "Sweden", "se", "Europe", 230e9, "SEK", "SEK", adv=2e8),
+        "ERIBR.HE": r("ERICSSON, TELEFONAB. L M SER. B", "Sweden", "fi", "Europe", None, "SEK", "EUR", adv=1e6),
     }
     out = S.dedupe(recs)
-    assert set(out) == {"SAP.DE", "DGE.L", "AIR.PA", "AAPL", "005930.KS", "DAL", "DELTA.BK", "SHEL.L"}
+    assert set(out) == {"SAP.DE", "DGE.L", "AIR.PA", "AAPL", "005930.KS", "DAL", "DELTA.BK", "SHEL.L", "ERIC-B.ST"}
 
 
 def test_intl_universe_reads_every_page_even_unsorted(monkeypatch):

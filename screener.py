@@ -471,8 +471,12 @@ def dedupe(recs: dict[str, dict]) -> dict[str, dict]:
         key = _fingerprint(r)
         if key not in best or rank(r) > rank(keep[best[key]]):
             best[key] = t
-    winners = set(best.values())
-    return {t: r for t, r in keep.items() if t in winners}
+    winners = {t: keep[t] for t in set(best.values())}
+    # A listing with no revenue from Yahoo (often a secondary listing, e.g. Helsinki lines of Swedish companies)
+    # can't be matched on fundamentals; drop it if a same-name listing that does have fundamentals survived.
+    named = {norm_name(r.get("name")) for r in winners.values() if r.get("_rev")}
+    return {t: r for t, r in winners.items() if r.get("_rev") or r.get("region") in ("us", "extra")
+            or norm_name(r.get("name")) not in named or not norm_name(r.get("name"))}
 
 
 # ---------------------------------------------------------------------------
