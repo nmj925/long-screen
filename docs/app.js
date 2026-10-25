@@ -507,6 +507,30 @@
     $("#table").innerHTML = head + `<tbody>${body}${empty}${more}</tbody>`;
   }
 
+  // ---------- TradingView symbols ----------
+  // Yahoo suffix -> TradingView exchange prefix. Exchanges where the two use different codes are left out.
+  const TV_EXCH = {
+    TO: "TSX", L: "LSE", DE: "XETR", PA: "EURONEXT", AS: "EURONEXT", BR: "EURONEXT", LS: "EURONEXT", MI: "MIL",
+    MC: "BME", SW: "SIX", VI: "VIE", ST: "OMXSTO", CO: "OMXCOP", HE: "OMXHEX", OL: "OSL", IC: "OMXICE", WA: "GPW",
+    AT: "ATHEX", RO: "BVB", BD: "BET", T: "TSE", HK: "HKEX", SS: "SSE", SZ: "SZSE", NS: "NSE", BO: "BSE", KS: "KRX",
+    KQ: "KRX", TW: "TWSE", TWO: "TPEX", AX: "ASX", NZ: "NZX", SI: "SGX", BK: "SET", JK: "IDX", PS: "PSE",
+    VN: "HOSE", SA: "BMFBOVESPA", MX: "BMV", SN: "BCS", BA: "BYMA", TA: "TASE", IS: "BIST", JO: "JSE", SR: "TADAWUL",
+    QA: "QSE", CA: "EGX", IR: "EURONEXT",
+  };
+  const NORDIC = new Set(["ST", "CO", "HE", "OL", "IC"]);
+  function tvSymbol(t) {
+    const dot = t.lastIndexOf(".");
+    if (dot < 0) return t.replace(/-/g, ".");                     // US: BRK-B -> BRK.B
+    const base = t.slice(0, dot), suf = t.slice(dot + 1);
+    const ex = TV_EXCH[suf];
+    if (!ex) return null;
+    let sym = base;
+    if (suf === "HK") sym = String(parseInt(base, 10));             // 0700 -> 700
+    else if (NORDIC.has(suf)) sym = base.replace(/-/g, "_");        // NOVO-B -> NOVO_B
+    else sym = base.replace(/-/g, ".");                             // BT-A -> BT.A
+    return `${ex}:${sym}`;
+  }
+
   // ---------- drawer ----------
   async function openDrawer(t) {
     const s = S.data.stocks.find((x) => x.t === t);
@@ -530,10 +554,14 @@
       ["Dividend yield", "pct", s.divy], ["Institutional ownership", "pct", s.inst], ["Analysts covering", "int", s.analysts],
       ["Data coverage (core metrics)", "pct", s.coverage]];
     const us = (s.region || "us") === "us" || (!t.includes(".") && (s.mkt || "US") === "US");
+    const tv = tvSymbol(t);
+    const tvLink = tv
+      ? `<a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tv)}" target="_blank" rel="noopener">TradingView chart</a>`
+      : `<a href="https://www.tradingview.com/search/?query=${encodeURIComponent(s.name || t)}" target="_blank" rel="noopener">Find on TradingView</a>`;
     const links = S.data.demo ? `<p class="hint">Links to Yahoo Finance, TradingView and filings appear here with real data.</p>` : `<div class="links">
+      ${tvLink}
       <a href="https://finance.yahoo.com/quote/${encodeURIComponent(t)}" target="_blank" rel="noopener">Yahoo Finance</a>
-      ${us ? `<a href="https://www.tradingview.com/chart/?symbol=${encodeURIComponent(t.replace("-", "."))}" target="_blank" rel="noopener">TradingView chart</a>
-      <a href="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${encodeURIComponent(t.replace("-", "."))}&type=10-K" target="_blank" rel="noopener">10-K filings</a>`
+      ${us ? `<a href="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${encodeURIComponent(t.replace("-", "."))}&type=10-K" target="_blank" rel="noopener">10-K filings</a>`
       : `<a href="https://www.google.com/search?q=${encodeURIComponent((s.name || t) + " annual report investor relations")}" target="_blank" rel="noopener">Annual report search</a>`}</div>`;
     $("#d-body").innerHTML = `
       <div class="d-head"><span class="tkr">${esc(t)} · ${esc(s.idx || "")}${s.country ? " · " + esc(s.country) : ""}</span><h2 id="d-title">${esc(s.name)}</h2>
