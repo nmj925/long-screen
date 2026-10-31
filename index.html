@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Long Screen</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--APP-->
+<header class="top">
+  <div class="wrap top-in">
+    <div class="brand">
+      <h1>Long Screen</h1>
+      <p class="sub" id="universe">Quality at a reasonable price</p>
+    </div>
+    <div class="fresh" id="fresh" aria-live="polite"></div>
+  </div>
+</header>
+
+<div class="banner wrap" id="demo-banner" hidden>
+  <strong>Sample data.</strong> These are fictional companies so you can try the dashboard. Your first screener run replaces them with real data for about 8,000 stocks worldwide.
+</div>
+
+<main class="wrap">
+  <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="criteria card" aria-labelledby="crit-h">
+    <div class="crit-head">
+      <div>
+        <h2 id="crit-h">Criteria</h2>
+        <p class="hint" id="crit-summary"></p>
+      </div>
+      <div class="crit-actions">
+        <button class="btn ghost" id="toggle-all" type="button" aria-expanded="false">Show all metrics</button>
+        <button class="btn ghost" id="reset" type="button">Reset to defaults</button>
+      </div>
+    </div>
+    <div class="funnel" id="funnel" aria-label="How many names each criterion removes"></div>
+    <div class="groups" id="groups" hidden></div>
+    <div class="sectors" id="markets-row">
+      <span class="label">Markets</span>
+      <div class="chips" id="markets"></div>
+    </div>
+    <div class="sectors">
+      <span class="label">Sectors</span>
+      <div class="chips" id="sectors"></div>
+    </div>
+  </section>
+
+  <section class="charts" aria-label="Charts">
+    <figure class="card chart-card wide">
+      <figcaption>
+        <h3>Value vs quality</h3>
+        <p class="hint">P/E against ROIC. Top-left is cheap and high-return.</p>
+      </figcaption>
+      <div class="legend" id="scatter-legend"></div>
+      <div class="chart" id="scatter"></div>
+    </figure>
+    <figure class="card chart-card">
+      <figcaption>
+        <h3>Passing by sector</h3>
+        <p class="hint">Concentration check</p>
+      </figcaption>
+      <div class="chart" id="sectorbars"></div>
+    </figure>
+    <figure class="card chart-card">
+      <figcaption>
+        <h3>Names passing over time</h3>
+        <p class="hint">Default criteria, one point per daily run</p>
+      </figcaption>
+      <div class="chart" id="history"></div>
+    </figure>
+  </section>
+
+  <section class="card results" aria-labelledby="res-h">
+    <div class="res-head">
+      <div class="tabs" role="tablist" id="tabs">
+        <button role="tab" type="button" data-view="pass" aria-selected="true">Passing <span class="count"></span></button>
+        <button role="tab" type="button" data-view="near" aria-selected="false">Near misses <span class="count"></span></button>
+        <button role="tab" type="button" data-view="watch" aria-selected="false">Watchlist <span class="count"></span></button>
+        <button role="tab" type="button" data-view="all" aria-selected="false">All <span class="count"></span></button>
+      </div>
+      <div class="res-tools">
+        <label class="search"><span class="sr">Search</span><input id="q" type="search" placeholder="Ticker, name or country" autocomplete="off"></label>
+        <button class="btn" id="export" type="button">Export CSV</button>
+      </div>
+    </div>
+    <h2 id="res-h" class="sr">Results</h2>
+    <p class="hint res-note" id="res-note"></p>
+    <div class="table-wrap"><table id="table"></table></div>
+  </section>
+
+  <footer class="foot">
+    <p>Data from Yahoo Finance via yfinance. Prices are in each stock's local currency; market caps and cash-flow figures are converted to US dollars. Fundamentals refresh after each US close; prices refresh hourly on weekdays. A screen finds candidates. Read the filings before you buy.</p>
+  </footer>
+</main>
+
+<aside class="drawer" id="drawer" aria-hidden="true" aria-labelledby="d-title">
+  <div class="drawer-in" role="dialog" aria-modal="false">
+    <button class="close" id="d-close" type="button" aria-label="Close">×</button>
+    <div id="d-body"></div>
+  </div>
+</aside>
+<div class="tip" id="tip" role="status" hidden></div>
+<!--/APP-->
+<script src="app.js"></script>
+</body>
+</html>
